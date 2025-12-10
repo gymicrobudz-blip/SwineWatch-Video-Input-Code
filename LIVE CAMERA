@@ -1,6 +1,6 @@
-# fix_detect_RPI_LiveDet.py
-# Run: python fix_detect_RPI_LiveDet.py
-# Keeps smooth display. Fixes color-order, clears stale candidates, logs detection counts, relaxed-but-sane filters.
+# fix_detect_RPI_LiveDet_fixed.py
+# Run: python fix_detect_RPI_LiveDet_fixed.py
+# Smooth display pipeline + improved detection logic. No recursion.
 
 import time
 import threading
@@ -11,7 +11,7 @@ from libcamera import controls
 import numpy as np
 import torch
 
-# PyTorch weights fix (kept)
+# -------------------- PyTorch weights fix (kept) --------------------
 orig_torch_load = torch.load
 def torch_load_wrapper(*args, **kwargs):
     kwargs["weights_only"] = False
@@ -24,22 +24,22 @@ IMG_SIZE = 640
 DISPLAY_SIZE = (800, 450)
 PROCESS_EVERY_N = 1
 
-# Filters (relaxed but useful)
-PIG_CONF_MIN = 0.25       # lower so we get detections
-MIN_AREA_FRAC = 0.003     # 0.3% of frame area minimum (capture 1280x720 -> ~2760 px)
+# Filters (tweak these if needed)
+PIG_CONF_MIN = 0.25       # detection confidence threshold
+MIN_AREA_FRAC = 0.003     # min box area fraction of full frame
 ASPECT_RATIO_MIN = 0.3
 ASPECT_RATIO_MAX = 3.0
 CONFIRM_FRAMES = 1
 MAX_TRACK_LOST = 5
 
-APPLY_SHARPEN = False     # turned off to avoid artifacts; enable if you want later
+APPLY_SHARPEN = False     # set True if you want mild unsharp mask
 
 CONF_ASF = 0.50
 CONF_BEHAVIOR = 0.50
 
-SHOW_CANDIDATES = True
+SHOW_CANDIDATES = True    # show translucent candidate boxes
 
-# Model paths (change if needed)
+# -------------------- Model paths --------------------
 MODEL_ASF_PATH = "/home/asfrotect/Downloads/best(ASF_MODEL)_.pt"
 MODEL_BEHAVIOR_PATH = "/home/asfrotect/Downloads/best(BEHAVIOR_MODEL)_.pt"
 MODEL_PIG_PATH = "/home/asfrotect/Downloads/pig_vs_non_pig.v3.pt"
@@ -54,7 +54,7 @@ print("Models loaded.")
 shared = {
     "latest_frame": None,
     "latest_results": [],    # confirmed tracks for display
-    "latest_candidates": [], # candidate boxes for display
+    "latest_candidates": [], # recent unconfirmed candidates for visibility
     "frame_ts": 0.0,
     "results_ts": 0.0
 }
@@ -66,6 +66,7 @@ class CameraThread(threading.Thread):
     def __init__(self, cap_size=(1280,720)):
         super().__init__(daemon=True)
         self.picam2 = Picamera2()
+        # video configuration -> better ISP path than preview
         self.config = self.picam2.create_video_configuration(main={"format":"RGB888","size":cap_size})
         self.picam2.configure(self.config)
         self.picam2.start()
@@ -74,7 +75,6 @@ class CameraThread(threading.Thread):
             print("Autofocus: Continuous")
         except Exception as e:
             print("Autofocus enable failed:", e)
-        self.stopped = False
 
     def run(self):
         while not stop_event.is_set():
@@ -183,7 +183,7 @@ class InferenceThread(threading.Thread):
         h = max(1, y2 - y1)
         area = w * h
         frame_area = w_frame * h_frame
-        # relaxed filter: require very low threshold only
+        # relaxed filter for candidates
         if conf < (PIG_CONF_MIN * 0.5):
             return False
         if area < (MIN_AREA_FRAC * frame_area * 0.5):
@@ -245,7 +245,7 @@ class InferenceThread(threading.Thread):
                 continue
 
             # frame_copy is RGB888 from Picamera2
-            # convert to BGR for OpenCV ops and pass BGR to model.predict (fixed color order)
+            # convert to BGR for OpenCV ops and pass BGR to model.predict
             frame_bgr = frame_copy[..., ::-1] if frame_copy.ndim == 3 and frame_copy.shape[2] == 3 else frame_copy
             frame_proc = frame_bgr.astype("uint8")
             if APPLY_SHARPEN:
@@ -254,8 +254,7 @@ class InferenceThread(threading.Thread):
                 except Exception:
                     pass
 
-            # IMPORTANT: pass BGR to model.predict to match earlier working path
-            # (Ultralytics accepts numpy arrays in BGR OpenCV format)
+            # PASS BGR to Ultralytics predict (works with OpenCV numpy BGR)
             try:
                 pig_results = pig_model.predict(source=frame_proc, conf=PIG_CONF_MIN, imgsz=IMG_SIZE, save=False, show=False, verbose=False)
             except Exception as e:
@@ -265,8 +264,6 @@ class InferenceThread(threading.Thread):
 
             candidates = []
             candidate_display = []
-
-            # debug counters
             pig_boxes_total = 0
 
             for r in pig_results:
@@ -285,7 +282,6 @@ class InferenceThread(threading.Thread):
 
                     # relaxed filter for candidates
                     if not self.filter_candidate(coords, conf, frame_proc.shape):
-                        # still show as candidate (if toggled)
                         candidate_display.append((coords, conf))
                         continue
 
@@ -358,47 +354,15 @@ class InferenceThread(threading.Thread):
             confirmed = self.produce_confirmed_results()
 
             # DEBUG LOG: counts
-            print(f"[infer] pig_box_candidates={pig_boxes_total} -> candidates={len(candidates)} confirmed_tracks={len(confirmed)}")
+            print(f"[infer] pig_box_candidates_total={pig_boxes_total} -> candidates={len(candidates)} confirmed_tracks={len(confirmed)}")
 
-            # publish results (ensure we clear candidates when empty)
+            # publish results
             with shared_lock:
                 shared["latest_results"] = confirmed
                 shared["latest_candidates"] = candidate_display if SHOW_CANDIDATES else []
                 shared["results_ts"] = time.time()
 
             time.sleep(0.001)
-
-    # Attach match_and_update_tracks and produce_confirmed_results from earlier definitions
-    def match_and_update_tracks(self, detections):
-        # method body reused from above (implement here)
-        matched = set()
-        IOU_THRESH = 0.35
-        for d in detections:
-            best_iou = 0.0
-            best_idx = None
-            for i, tr in enumerate(self.tracks):
-                iouv = iou(d['box'], tr.box)
-                if iouv > best_iou:
-                    best_iou = iouv
-                    best_idx = i
-            if best_iou >= IOU_THRESH and best_idx is not None:
-                tr = self.tracks[best_idx]
-                tr.update(d['box'], d['conf'], d.get('behavior'), d.get('lesions'), d.get('parts'))
-                matched.add(best_idx)
-            else:
-                nt = Track(d['box'], d['conf'], behavior=d.get('behavior'), lesions=d.get('lesions'), parts=d.get('parts'))
-                self.tracks.append(nt)
-        for i, tr in enumerate(self.tracks):
-            if i not in matched:
-                tr.mark_lost()
-        self.tracks = [tr for tr in self.tracks if tr.lost <= MAX_TRACK_LOST]
-
-    def produce_confirmed_results(self):
-        return self.__class__.produce_confirmed_results(self)
-
-# bind methods to class
-InferenceThread.match_and_update_tracks = InferenceThread.match_and_update_tracks
-InferenceThread.produce_confirmed_results = InferenceThread.produce_confirmed_results
 
 # -------------------- Display helpers --------------------
 def draw_label_small(img, box, label, color=(0,255,0), thickness=1):
@@ -431,7 +395,7 @@ def main():
                 time.sleep(0.005)
                 continue
 
-            # frame is RGB888 -> convert to BGR for display (OpenCV)
+            # frame is RGB888 -> convert to BGR for display
             frame_bgr = frame[..., ::-1] if frame.ndim == 3 and frame.shape[2] == 3 else frame
             disp = cv2.resize(frame_bgr, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
 
