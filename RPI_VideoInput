@@ -6,7 +6,6 @@ from ultralytics import YOLO
 import time
 import tkinter as tk
 from tkinter import filedialog
-from time import perf_counter
 
 # -------------------------- Fix for PyTorch 2.6+ weights loading --------------------------
 orig_torch_load = torch.load
@@ -22,15 +21,15 @@ BEHAVIOR_MODEL_PATH = "/home/asfrotect/Projects/best(BEHAVIOR_MODEL)_.pt"
 
 # -------------------------- Settings --------------------------
 DETECTION_INTERVAL = 3.0   # seconds between full detections and how long boxes remain visible
-DEBUG = False              # set True to see debug prints
-# Optionally resize frame used for detection to speed it up (set to None to disable)
-RESIZE_FOR_DETECTION = None  # e.g. (640, 360) to reduce detection workload
+# If your Pi is slow, set RESIZE_FOR_DETECTION to (640,360) or similar to speed up inference.
+RESIZE_FOR_DETECTION = None  # or (640,360)
+DEBUG = False               # set True to print debug info
 
 # -------------------------- Choose video file via file dialog --------------------------
 def choose_video_file():
     root = tk.Tk()
-    root.withdraw()  # hide main window
-    root.attributes("-topmost", True)  # bring dialog on top
+    root.withdraw()
+    root.attributes("-topmost", True)
     file_path = filedialog.askopenfilename(
         title="Select video file",
         filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]
@@ -53,7 +52,13 @@ print(f"Selected video: {video_path}")
 def load_model_or_none(path, model_name):
     if path and os.path.isfile(path):
         print(f"Loading {model_name} model from: {path}")
-        return YOLO(path)
+        try:
+            m = YOLO(path)
+            print(f"[OK] {model_name} model loaded.")
+            return m
+        except Exception as e:
+            print(f"[ERROR] Failed to load {model_name} model: {e}")
+            return None
     else:
         print(f"[WARN] {model_name} model path not provided or file missing. {model_name} detection will be skipped.")
         return None
@@ -90,12 +95,13 @@ last_detection_time = -DETECTION_INTERVAL   # force immediate detection at start
 annotated_boxes = []    # list of tuples: (coords, label, color)
 expiry_time = 0.0
 
-# -------------------------- FPS smoothing (averaged over 1s) --------------------------
+# -------------------------- FPS averaging (1-second window) --------------------------
 last_fps_time = time.time()
 frame_counter_for_fps = 0
 display_fps = 0.0
 
-# -------------------------- Main loop --------------------------
+print("[INFO] Starting processing loop. Press ESC to stop.")
+
 try:
     while True:
         ret, frame = cap.read()
@@ -105,58 +111,65 @@ try:
 
         now = time.time()
 
-        # If it's time to run detection, run it synchronously on a copy (optionally resized)
+        # if it's time to detect, run detection synchronously (keeps original logic intact)
         if (now - last_detection_time) >= DETECTION_INTERVAL:
-            # copy frame for detection
-            frame_for_detection = frame.copy()
+            # prepare frame for detection (optionally resize to speed up)
             if RESIZE_FOR_DETECTION is not None:
-                frame_for_detection_small = cv2.resize(frame_for_detection, RESIZE_FOR_DETECTION)
+                frame_for_detection = cv2.resize(frame.copy(), RESIZE_FOR_DETECTION)
             else:
-                frame_for_detection_small = frame_for_detection
+                frame_for_detection = frame.copy()
 
-            # run pig detection (same logic)
-            pig_results = pig_model.predict(source=frame_for_detection_small, conf=0.3, save=False, show=False, verbose=False)
+            # STEP 1: Detect pigs (same as your original)
+            try:
+                pig_results = pig_model.predict(source=frame_for_detection, conf=0.3, save=False, show=False, verbose=False)
+            except Exception as e:
+                print(f"[ERROR] pig_model.predict failed: {e}")
+                pig_results = []
+
             pig_boxes = []
-            for r in pig_results:
-                for box in r.boxes:
-                    try:
-                        cls_id = int(box.cls[0].item())
-                        conf = float(box.conf[0].item())
-                    except Exception:
-                        cls_id = int(box.cls)
-                        conf = float(box.conf)
-                    if conf < 0.3:
-                        continue
-                    label = r.names.get(cls_id, str(cls_id)) if hasattr(r, "names") else str(cls_id)
-                    if "pig" in label.lower():
-                        pig_boxes.append((box, conf))
+            try:
+                for r in pig_results:
+                    for box in r.boxes:
+                        try:
+                            cls_id = int(box.cls[0].item())
+                            conf = float(box.conf[0].item())
+                        except Exception:
+                            cls_id = int(box.cls)
+                            conf = float(box.conf)
+                        if conf < 0.3:
+                            continue
+                        label = r.names.get(cls_id, str(cls_id)) if hasattr(r, "names") else str(cls_id)
+                        if "pig" in label.lower():
+                            pig_boxes.append((box, conf))
+            except Exception as e:
+                print(f"[ERROR] parsing pig_results: {e}")
+                pig_boxes = []
 
-            # prepare output annotated list
+            # prepare new annotated list
             new_annotated = []
 
-            # compute scaling factors if we resized for detection
+            # If we resized for detection, compute rescale factors to map boxes back to original frame
             scale_x = 1.0
             scale_y = 1.0
             if RESIZE_FOR_DETECTION is not None:
-                orig_h, orig_w = frame_for_detection.shape[:2]
+                orig_h, orig_w = frame.shape[:2]
                 small_w, small_h = RESIZE_FOR_DETECTION
                 scale_x = orig_w / small_w
                 scale_y = orig_h / small_h
 
-            # For each pig box run ASF + behavior (same logic) and map coordinates
+            # STEP 2: For each pig, run ASF + behavior (unchanged)
             for pig_box, pig_conf in pig_boxes:
                 bx1, by1, bx2, by2 = map(int, pig_box.xyxy[0])
-                # rescale box coords back to original if needed
                 if RESIZE_FOR_DETECTION is not None:
                     bx1 = int(bx1 * scale_x)
                     by1 = int(by1 * scale_y)
                     bx2 = int(bx2 * scale_x)
                     by2 = int(by2 * scale_y)
 
-                h_frame, w_frame = frame_for_detection.shape[:2]
+                h_frame, w_frame = frame.shape[:2]
                 x1, y1 = max(0, bx1), max(0, by1)
                 x2, y2 = min(w_frame - 1, bx2), min(h_frame - 1, by2)
-                pig_crop = frame_for_detection[y1:y2, x1:x2]
+                pig_crop = frame[y1:y2, x1:x2]
                 if pig_crop.size == 0:
                     continue
 
@@ -164,43 +177,57 @@ try:
                 lesion_boxes = []
                 part_boxes = []
                 if asf_model is not None:
-                    asf_results = asf_model.predict(source=pig_crop, conf=0.5, save=False, show=False, verbose=False)
-                    for r in asf_results:
-                        for a_box in r.boxes:
-                            try:
-                                cls_id = int(a_box.cls[0].item())
-                                conf = float(a_box.conf[0].item())
-                            except Exception:
-                                cls_id = int(a_box.cls)
-                                conf = float(a_box.conf)
-                            if conf < 0.5:
-                                continue
-                            label = r.names[cls_id]
-                            ax1, ay1, ax2, ay2 = map(int, a_box.xyxy[0])
-                            # map crop coords back to original frame coords
-                            ax1, ay1, ax2, ay2 = ax1 + x1, ay1 + y1, ax2 + x1, ay2 + y1
-                            if "lesion" in label.lower():
-                                lesion_boxes.append((ax1, ay1, ax2, ay2))
-                            elif label.lower() in ["ear", "leg", "nose", "tail"]:
-                                part_boxes.append((ax1, ay1, ax2, ay2, label))
+                    try:
+                        asf_results = asf_model.predict(source=pig_crop, conf=0.5, save=False, show=False, verbose=False)
+                    except Exception as e:
+                        print(f"[ERROR] asf_model.predict failed: {e}")
+                        asf_results = []
+                    try:
+                        for r in asf_results:
+                            for a_box in r.boxes:
+                                try:
+                                    cls_id = int(a_box.cls[0].item())
+                                    conf = float(a_box.conf[0].item())
+                                except Exception:
+                                    cls_id = int(a_box.cls)
+                                    conf = float(a_box.conf)
+                                if conf < 0.5:
+                                    continue
+                                label = r.names[cls_id]
+                                ax1, ay1, ax2, ay2 = map(int, a_box.xyxy[0])
+                                # map crop coords back to original frame coords
+                                ax1, ay1, ax2, ay2 = ax1 + x1, ay1 + y1, ax2 + x1, ay2 + y1
+                                if "lesion" in label.lower():
+                                    lesion_boxes.append((ax1, ay1, ax2, ay2))
+                                elif label.lower() in ["ear", "leg", "nose", "tail"]:
+                                    part_boxes.append((ax1, ay1, ax2, ay2, label))
+                    except Exception as e:
+                        print(f"[ERROR] parsing asf_results: {e}")
 
                 # Behavior detection
                 behavior_label = None
                 if behavior_model is not None:
-                    behavior_results = behavior_model.predict(source=pig_crop, conf=0.5, save=False, show=False, verbose=False)
-                    for r in behavior_results:
-                        for b_box in r.boxes:
-                            try:
-                                cls_id = int(b_box.cls[0].item())
-                                conf = float(b_box.conf[0].item())
-                            except Exception:
-                                cls_id = int(b_box.cls)
-                                conf = float(b_box.conf)
-                            if conf >= 0.5:
-                                behavior_label = r.names[cls_id]
+                    try:
+                        behavior_results = behavior_model.predict(source=pig_crop, conf=0.5, save=False, show=False, verbose=False)
+                    except Exception as e:
+                        print(f"[ERROR] behavior_model.predict failed: {e}")
+                        behavior_results = []
+                    try:
+                        for r in behavior_results:
+                            for b_box in r.boxes:
+                                try:
+                                    cls_id = int(b_box.cls[0].item())
+                                    conf = float(b_box.conf[0].item())
+                                except Exception:
+                                    cls_id = int(b_box.cls)
+                                    conf = float(b_box.conf)
+                                if conf >= 0.5:
+                                    behavior_label = r.names[cls_id]
+                                    break
+                            if behavior_label:
                                 break
-                        if behavior_label:
-                            break
+                    except Exception as e:
+                        print(f"[ERROR] parsing behavior_results: {e}")
 
                 behavior_label_full = f"pig-{pig_conf:.2f}-{behavior_label.lower()}" if behavior_label else f"pig-{pig_conf:.2f}"
 
@@ -216,18 +243,17 @@ try:
                             break
                     new_annotated.append((lesion, merged_label, (0,0,255)))
 
-            # store annotation results and expiry
             annotated_boxes = new_annotated
             expiry_time = now + DETECTION_INTERVAL
             last_detection_time = now
 
             if DEBUG:
-                print(f"[DETECT] ran detection at {time.strftime('%H:%M:%S')}, boxes: {len(annotated_boxes)}")
+                print(f"[DETECT] ran detection @ {time.strftime('%H:%M:%S')}, boxes: {len(annotated_boxes)}")
 
-        # prepare display copy
+        # Prepare display
         im_bgr = frame.copy()
 
-        # draw boxes if still valid (not expired)
+        # draw boxes if still within expiry
         if time.time() <= expiry_time and annotated_boxes:
             for (coords, label, color) in annotated_boxes:
                 draw_label(im_bgr, coords, label, color=color)
