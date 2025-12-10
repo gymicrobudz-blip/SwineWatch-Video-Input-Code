@@ -1,0 +1,236 @@
+# optimized_RPI_LiveDet.py
+# python optimized_RPI_LiveDet.py
+
+import os
+import time
+import threading
+import cv2
+import torch
+from ultralytics import YOLO
+from picamera2 import Picamera2
+
+# -------------------------- PyTorch 2.6+ weights fix (keeps your wrapper) --------------------------
+orig_torch_load = torch.load
+def torch_load_wrapper(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return orig_torch_load(*args, **kwargs)
+torch.load = torch_load_wrapper
+
+# -------------------------- User-tunable knobs --------------------------
+CAPTURE_SIZE = (1280, 720)   # camera sensor capture resolution (w, h). Camera v3 can do higher; start here.
+IMG_SIZE = 640               # model input size (imgsz). Lower -> faster, less detail.
+PROCESS_EVERY_N = 1          # 1 = process every frame pulled from buffer; increase to 2+ to skip some inferences
+DRAW_EVERY_N = 1             # draw boxes every N processed frames (reduce overhead)
+CONF_PIG = 0.30
+CONF_ASF = 0.50
+CONF_BEHAVIOR = 0.50
+
+# -------------------------- Model paths (fix any typos) --------------------------
+MODEL_ASF_PATH = "/home/asfrotect/Downloads/best(ASF_MODEL)_.pt"
+MODEL_BEHAVIOR_PATH = "/home/asfrotect/Downloads/best(BEHAVIOR_MODEL)_.pt"
+MODEL_PIG_PATH = "/home/asfrotect/Downloads/pig_vs_non_pig.v3.pt"
+
+print("Loading models (this may take a while)...")
+pig_model = YOLO(MODEL_PIG_PATH)
+asf_model = YOLO(MODEL_ASF_PATH)
+behavior_model = YOLO(MODEL_BEHAVIOR_PATH)
+print("All models loaded successfully.")
+
+# -------------------------- Threaded camera capture (keeps latest frame only) --------------------------
+class CameraThread(threading.Thread):
+    def __init__(self, cap_size=(1280,720)):
+        super().__init__(daemon=True)
+        self.picam2 = Picamera2()
+        self.config = self.picam2.create_preview_configuration(main={"format": "XRGB8888", "size": cap_size})
+        self.picam2.configure(self.config)
+        self.picam2.start()
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.stopped = False
+
+    def run(self):
+        while not self.stopped:
+            try:
+                frame = self.picam2.capture_array()
+                # Frame may be XRGB (4 channels) — store as-is, convert later
+                with self.lock:
+                    self.latest_frame = frame
+            except Exception as e:
+                # small sleep on error to avoid busy loop
+                time.sleep(0.01)
+
+    def read(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return None
+            # Return a copy so main thread can process safely
+            return self.latest_frame.copy()
+
+    def stop(self):
+        self.stopped = True
+        try:
+            self.picam2.stop()
+        except Exception:
+            pass
+
+# -------------------------- Utils (unchanged logic) --------------------------
+def draw_label(frame, box, label, color=(0,255,0)):
+    x1, y1, x2, y2 = map(int, box)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+def box_inside(boxA, boxB):
+    ax1, ay1, ax2, ay2 = map(int, boxA)
+    bx1, by1, bx2, by2 = map(int, boxB)
+    return ax1 >= bx1 and ay1 >= by1 and ax2 <= bx2 and ay2 <= by2
+
+# -------------------------- Main inference loop --------------------------
+def main():
+    cam = CameraThread(cap_size=CAPTURE_SIZE)
+    cam.start()
+    time.sleep(0.2)  # let camera warm up
+
+    proc_count = 0
+    draw_count = 0
+    fps_t0 = time.time()
+    frames_processed = 0
+    infer_time_accum = 0.0
+
+    try:
+        while True:
+            frame = cam.read()          # always get the latest frame (may be None)
+            if frame is None:
+                time.sleep(0.001)
+                continue
+
+            # Optional: skip processing some frames if inference is too slow
+            proc_count += 1
+            if proc_count % PROCESS_EVERY_N != 0:
+                # Still show the latest frame (optional)
+                disp = frame[..., :3] if frame.ndim == 3 and frame.shape[2] == 4 else frame
+                cv2.imshow("Pig + ASF + Behavior Detection", disp)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+                continue
+
+            t0 = time.time()
+
+            # Convert RGBA/XRGB -> BGR 3-channel expected by OpenCV/Ultralytics
+            if frame.ndim == 3 and frame.shape[2] == 4:
+                frame_proc = frame[..., :3]   # drop alpha / X channel
+            else:
+                frame_proc = frame
+
+            # Ensure correct dtype
+            frame_proc = frame_proc.astype("uint8")
+
+            # ---------- Pig detection (run on full frame but set imgsz so model internally resizes) ----------
+            # We keep your detection call structure but pass imgsz for speed.
+            pig_results = pig_model.predict(source=frame_proc, conf=CONF_PIG, imgsz=IMG_SIZE, save=False, show=False, verbose=False)
+
+            pig_boxes = []
+            for r in pig_results:
+                for box in r.boxes:
+                    try:
+                        cls_id = int(box.cls[0].item())
+                        conf = float(box.conf[0].item())
+                    except Exception:
+                        cls_id = int(box.cls)
+                        conf = float(box.conf)
+                    if conf < CONF_PIG:
+                        continue
+                    coords = list(map(int, box.xyxy[0]))
+                    label = r.names.get(cls_id, str(cls_id)) if hasattr(r, "names") else str(cls_id)
+                    if "pig" in label.lower():
+                        pig_boxes.append((box, conf))
+
+            im_bgr = frame_proc.copy()
+
+            # ---------- Per-pig: ASF + behavior on pig_crop ----------
+            for pig_box, pig_conf in pig_boxes:
+                x1, y1, x2, y2 = map(int, pig_box.xyxy[0])
+                h_frame, w_frame = frame_proc.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w_frame - 1, x2), min(h_frame - 1, y2)
+                pig_crop = frame_proc[y1:y2, x1:x2]
+                if pig_crop.size == 0:
+                    continue
+
+                # ASF detection (use imgsz to speed internal resize)
+                asf_results = asf_model.predict(source=pig_crop, conf=CONF_ASF, imgsz=IMG_SIZE, save=False, show=False, verbose=False)
+                lesion_boxes = []
+                part_boxes = []
+
+                for r in asf_results:
+                    for a_box in r.boxes:
+                        try:
+                            cls_id = int(a_box.cls[0].item())
+                            conf = float(a_box.conf[0].item())
+                        except Exception:
+                            cls_id = int(a_box.cls)
+                            conf = float(a_box.conf)
+                        if conf < CONF_ASF:
+                            continue
+                        label = r.names[cls_id]
+                        ax1, ay1, ax2, ay2 = map(int, a_box.xyxy[0])
+                        # map back to full frame coordinates (pig_crop origin offset)
+                        ax1, ay1, ax2, ay2 = ax1 + x1, ay1 + y1, ax2 + x1, ay2 + y1
+                        if "lesion" in label.lower():
+                            lesion_boxes.append((ax1, ay1, ax2, ay2))
+                        elif label.lower() in ["ear", "leg", "nose", "tail"]:
+                            part_boxes.append((ax1, ay1, ax2, ay2, label))
+
+                # Behavior detection
+                behavior_results = behavior_model.predict(source=pig_crop, conf=CONF_BEHAVIOR, imgsz=IMG_SIZE, save=False, show=False, verbose=False)
+                behavior_label = None
+                for r in behavior_results:
+                    for b_box in r.boxes:
+                        try:
+                            cls_id = int(b_box.cls[0].item())
+                            conf = float(b_box.conf[0].item())
+                        except Exception:
+                            cls_id = int(b_box.cls)
+                            conf = float(b_box.conf)
+                        if conf >= CONF_BEHAVIOR:
+                            behavior_label = r.names[cls_id]
+                            break
+                    if behavior_label:
+                        break
+
+                behavior_label_full = f"pig-{pig_conf:.2f}-{behavior_label.lower()}" if behavior_label else f"pig-{pig_conf:.2f}"
+
+                # Draw ASF lesions
+                for lesion in lesion_boxes:
+                    merged_label = "possible skin lesion"
+                    for (px1, py1, px2, py2, part_label) in part_boxes:
+                        if box_inside(lesion, (px1, py1, px2, py2)):
+                            merged_label = f"possible skin lesion - {part_label.lower()}"
+                            break
+                    draw_label(im_bgr, lesion, merged_label, color=(0,0,255))
+
+                # Draw pig + behavior label
+                draw_label(im_bgr, (x1, y1, x2, y2), behavior_label_full, color=(0,255,0))
+
+            # Display FPS & show every DRAW_EVERY_N processed frames
+            infer_t = time.time() - t0
+            infer_time_accum += infer_t
+            frames_processed += 1
+            avg_infer = infer_time_accum / max(1, frames_processed)
+            fps = 1.0 / avg_infer if avg_infer > 0 else 0.0
+            cv2.putText(im_bgr, f"FPS(est): {fps:.2f}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+
+            draw_count += 1
+            if draw_count % DRAW_EVERY_N == 0:
+                cv2.imshow("Pig + ASF + Behavior Detection", im_bgr)
+
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cam.stop()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
