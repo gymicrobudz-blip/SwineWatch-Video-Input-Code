@@ -21,6 +21,12 @@ PIG_MODEL_PATH = "/home/asfrotect/Projects/pig_vs_non_pig.v3.pt"
 ASF_MODEL_PATH = "/home/asfrotect/Projects/best(ASF_MODEL)_.pt"
 BEHAVIOR_MODEL_PATH = "/home/asfrotect/Projects/best(BEHAVIOR_MODEL)_.pt"
 
+# -------------------------- Settings (tweak these) --------------------------
+DETECTION_INTERVAL = 3.0          # seconds between full detections (and how long boxes remain visible)
+# Optionally resize frames BEFORE sending to detection worker to speed up inference.
+# Set to None to keep original size, or (width, height) e.g. (640,360)
+RESIZE_FOR_DETECTION = (640,360)
+
 # -------------------------- Choose video file via file dialog --------------------------
 def choose_video_file():
     root = tk.Tk()
@@ -71,11 +77,9 @@ if not cap.isOpened():
 def draw_label(frame, box, label, color=(0,255,0)):
     x1, y1, x2, y2 = map(int, box)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    # Put text with background for readability
     (w_text, h_text), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
     cv2.rectangle(frame, (x1, y1 - h_text - 8), (x1 + w_text + 6, y1), color, -1)
-    cv2.putText(frame, label, (x1 + 3, y1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+    cv2.putText(frame, label, (x1 + 3, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
 
 def box_inside(boxA, boxB):
     ax1, ay1, ax2, ay2 = map(int, boxA)
@@ -83,8 +87,7 @@ def box_inside(boxA, boxB):
     return ax1 >= bx1 and ay1 >= by1 and ax2 <= bx2 and ay2 <= by2
 
 # -------------------------- Detection scheduling + worker --------------------------
-DETECTION_INTERVAL = 3.0  # seconds: run detection every 3s
-detection_queue = queue.Queue(maxsize=1)  # hold 1 frame to detect (drop-old)
+detection_queue = queue.Queue(maxsize=1)   # 1-slot queue (drop-old policy)
 annotated_lock = threading.Lock()
 annotated_boxes = []   # list of tuples: (box_coords, label, color)
 expiry_time = 0.0
@@ -98,13 +101,19 @@ def detection_worker():
         except queue.Empty:
             continue
 
+        # optionally resize for faster inference
+        if RESIZE_FOR_DETECTION is not None:
+            frame_small = cv2.resize(frame_for_detection, RESIZE_FOR_DETECTION)
+        else:
+            frame_small = frame_for_detection
+
         # ensure 3-channel uint8
-        src = frame_for_detection
+        src = frame_small
         if src.ndim == 3 and src.shape[2] == 4:
             src = src[..., :3]
         src = src.astype('uint8')
 
-        boxes_out = []  # collect (x1,y1,x2,y2,label,color)
+        boxes_out = []  # collect (coords, label, color)
 
         # ---------- Step 1: Detect pigs ----------
         pig_results = pig_model.predict(source=src, conf=0.3, save=False, show=False, verbose=False)
@@ -121,13 +130,30 @@ def detection_worker():
                 if "pig" in label.lower():
                     pig_boxes.append((box, conf))
 
-        # ---------- Step 2: For each pig, detect ASF and behavior ----------
+        # Map coordinates back to original frame size if resized
+        scale_x = 1.0
+        scale_y = 1.0
+        if RESIZE_FOR_DETECTION is not None:
+            orig_h, orig_w = frame_for_detection.shape[:2]
+            small_w, small_h = RESIZE_FOR_DETECTION
+            scale_x = orig_w / small_w
+            scale_y = orig_h / small_h
+
+        # ---------- Step 2: For each pig, detect ASF lesions and behavior ----------
         for pig_box, pig_conf in pig_boxes:
-            x1, y1, x2, y2 = map(int, pig_box.xyxy[0])
-            h_frame, w_frame = src.shape[:2]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w_frame - 1, x2), min(h_frame - 1, y2)
-            pig_crop = src[y1:y2, x1:x2]
+            bx1, by1, bx2, by2 = map(int, pig_box.xyxy[0])
+            # if resized, rescale pig box to original coordinates
+            if RESIZE_FOR_DETECTION is not None:
+                bx1 = int(bx1 * scale_x)
+                by1 = int(by1 * scale_y)
+                bx2 = int(bx2 * scale_x)
+                by2 = int(by2 * scale_y)
+
+            # crop from original-size coordinates for ASF/behavior (better accuracy)
+            # careful with bounds
+            orig_h, orig_w = frame_for_detection.shape[:2]
+            x1, y1, x2, y2 = max(0, bx1), max(0, by1), min(orig_w - 1, bx2), min(orig_h - 1, by2)
+            pig_crop = frame_for_detection[y1:y2, x1:x2]
             if pig_crop.size == 0:
                 continue
 
@@ -146,6 +172,7 @@ def detection_worker():
                             continue
                         label = r.names[cls_id]
                         ax1, ay1, ax2, ay2 = map(int, a_box.xyxy[0])
+                        # map crop coords back to original frame coords
                         ax1, ay1, ax2, ay2 = ax1 + x1, ay1 + y1, ax2 + x1, ay2 + y1
                         if "lesion" in label.lower():
                             lesion_boxes.append((ax1, ay1, ax2, ay2))
@@ -185,22 +212,23 @@ def detection_worker():
         # store results and set expiry
         with annotated_lock:
             annotated_boxes = boxes_out
-            expiry_time = time.time() + DETECTION_INTERVAL  # keep boxes visible for DETECTION_INTERVAL seconds
+            expiry_time = time.time() + DETECTION_INTERVAL
 
         try:
             detection_queue.task_done()
         except Exception:
             pass
 
-# start worker thread
+# start detection worker thread
 worker = threading.Thread(target=detection_worker, daemon=True)
 worker.start()
+
+# force first detection immediately (so user sees boxes quickly)
+last_detection_request = -DETECTION_INTERVAL
 
 # -------------------------- Main processing loop (display every frame) --------------------------
 frame_count = 0
 fps_time = time.time()
-
-last_detection_request = 0.0
 
 try:
     while True:
@@ -210,10 +238,9 @@ try:
             break
 
         frame_count += 1
-
         im_bgr = frame.copy()
 
-        # If annotated boxes are still valid (not expired), draw them
+        # Draw annotated boxes if within expiry
         now = time.time()
         with annotated_lock:
             current_boxes = annotated_boxes.copy()
@@ -223,7 +250,7 @@ try:
             for (box_coords, label, color) in current_boxes:
                 draw_label(im_bgr, box_coords, label, color=color)
 
-        # Display FPS (display FPS measured per displayed frame)
+        # Display FPS (measured per displayed frame)
         now2 = time.time()
         fps = 1.0 / (now2 - fps_time) if (now2 - fps_time) > 0 else 0.0
         fps_time = now2
@@ -231,17 +258,21 @@ try:
 
         cv2.imshow("Pig + ASF + Behavior Detection", im_bgr)
 
-        # If it's time to request a detection (every DETECTION_INTERVAL seconds), push latest frame (non-blocking)
+        # Request detection every DETECTION_INTERVAL seconds (non-blocking push)
         if (now - last_detection_request) >= DETECTION_INTERVAL:
             try:
-                # drop old queued frame if exists, keep latest
+                # prepare frame_for_detection: optionally resize to speed inference
+                frame_to_queue = frame.copy()
+                if RESIZE_FOR_DETECTION is not None:
+                    frame_to_queue = cv2.resize(frame_to_queue, RESIZE_FOR_DETECTION)
+                # drop-old and push latest
                 if detection_queue.full():
                     try:
                         _ = detection_queue.get_nowait()
                         detection_queue.task_done()
                     except Exception:
                         pass
-                detection_queue.put_nowait(frame.copy())
+                detection_queue.put_nowait(frame_to_queue if RESIZE_FOR_DETECTION is not None else frame.copy())
                 last_detection_request = now
             except queue.Full:
                 pass
@@ -258,8 +289,8 @@ finally:
             detection_queue.task_done()
     except Exception:
         pass
-
     worker.join(timeout=1.0)
     cap.release()
     cv2.destroyAllWindows()
     print("Exited cleanly.")
+
