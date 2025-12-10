@@ -1,40 +1,46 @@
-# robust_detect_RPI_LiveDet.py
-# Drop-in replacement: keeps smooth display & camera settings, improves detection robustness.
-# Run: python robust_detect_RPI_LiveDet.py
+# relaxed_detect_RPI_LiveDet.py
+# Run: python relaxed_detect_RPI_LiveDet.py
+# Looser detection filters + visualized candidates. Keeps smooth display & autofocus.
 
 import time
 import threading
 import cv2
-import torch
 from ultralytics import YOLO
 from picamera2 import Picamera2
 from libcamera import controls
 import numpy as np
+import torch
 
-# -------------------------- PyTorch fix --------------------------
+# PyTorch wrapper (kept)
 orig_torch_load = torch.load
 def torch_load_wrapper(*args, **kwargs):
     kwargs["weights_only"] = False
     return orig_torch_load(*args, **kwargs)
 torch.load = torch_load_wrapper
 
-# -------------------------- Tunable knobs (robust defaults) --------------------------
-CAPTURE_SIZE = (1280, 720)   # (w,h)
-IMG_SIZE = 640               # model imgsz
-DISPLAY_SIZE = (800, 450)    # display copy
-PROCESS_EVERY_N = 1          # inference pacing
-PIG_CONF_MIN = 0.40          # raise base pig confidence to reduce false positives
-MIN_AREA_FRAC = 0.01         # ignore boxes smaller than this fraction of full-frame area (1% default)
-ASPECT_RATIO_MIN = 0.5       # width/height lower bound for pigs
-ASPECT_RATIO_MAX = 2.0       # width/height upper bound for pigs
-CONFIRM_FRAMES = 2           # require detection to appear in N consecutive inference cycles
-MAX_TRACK_LOST = 3           # allow up to N missed frames before deleting a track
-APPLY_SHARPEN = True         # keep mild sharpening from previous script
+# -------------------- Tunable knobs (relaxed) --------------------
+CAPTURE_SIZE = (1280, 720)
+IMG_SIZE = 640
+DISPLAY_SIZE = (800, 450)
+
+PROCESS_EVERY_N = 1
+
+# Relaxed thresholds (more permissive)
+PIG_CONF_MIN = 0.30        # was 0.40 -> lower to show more pigs
+MIN_AREA_FRAC = 0.005      # was 0.01 -> allow boxes >= 0.5% of frame area
+ASPECT_RATIO_MIN = 0.3     # was 0.5 -> wider acceptance
+ASPECT_RATIO_MAX = 3.0     # was 2.0 -> allow taller/wider pigs
+CONFIRM_FRAMES = 1         # show detection immediately (was 2)
+MAX_TRACK_LOST = 5         # keep tracks longer
+APPLY_SHARPEN = True
 
 CONF_ASF = 0.50
 CONF_BEHAVIOR = 0.50
 
-# -------------------------- Model paths (adjust if needed) --------------------------
+# Show candidate boxes (unconfirmed) with light color
+SHOW_CANDIDATES = True
+
+# -------------------- Model paths (edit if needed) --------------------
 MODEL_ASF_PATH = "/home/asfrotect/Downloads/best(ASF_MODEL)_.pt"
 MODEL_BEHAVIOR_PATH = "/home/asfrotect/Downloads/best(BEHAVIOR_MODEL)_.pt"
 MODEL_PIG_PATH = "/home/asfrotect/Downloads/pig_vs_non_pig.v3.pt"
@@ -45,19 +51,20 @@ asf_model = YOLO(MODEL_ASF_PATH)
 behavior_model = YOLO(MODEL_BEHAVIOR_PATH)
 print("Models loaded.")
 
-# -------------------------- Shared state (unchanged) --------------------------
+# -------------------- Shared state --------------------
 shared = {
     "latest_frame": None,
-    "latest_results": [],   # this will contain only confirmed tracks (for display)
+    "latest_results": [],   # confirmed tracks for display
+    "latest_candidates": [],# recent unconfirmed candidates for visibility
     "frame_ts": 0.0,
     "results_ts": 0.0
 }
 shared_lock = threading.Lock()
 stop_event = threading.Event()
 
-# -------------------------- Camera thread (video config + autofocus) --------------------------
+# -------------------- Camera thread --------------------
 class CameraThread(threading.Thread):
-    def __init__(self, cap_size=(1280,720), framerate=30):
+    def __init__(self, cap_size=(1280,720)):
         super().__init__(daemon=True)
         self.picam2 = Picamera2()
         self.config = self.picam2.create_video_configuration(main={"format": "RGB888", "size": cap_size})
@@ -65,7 +72,7 @@ class CameraThread(threading.Thread):
         self.picam2.start()
         try:
             self.picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
-            print("Autofocus set: Continuous")
+            print("Autofocus: Continuous")
         except Exception as e:
             print("Autofocus enable failed:", e)
         self.stopped = False
@@ -91,9 +98,8 @@ class CameraThread(threading.Thread):
         except Exception:
             pass
 
-# -------------------------- Tracking utilities --------------------------
+# -------------------- Tracking utilities --------------------
 def iou(boxA, boxB):
-    # boxes are (x1,y1,x2,y2)
     ax1, ay1, ax2, ay2 = boxA
     bx1, by1, bx2, by2 = boxB
     inter_x1 = max(ax1, bx1)
@@ -102,20 +108,19 @@ def iou(boxA, boxB):
     inter_y2 = min(ay2, by2)
     iw = max(0, inter_x2 - inter_x1)
     ih = max(0, inter_y2 - inter_y1)
-    inter_area = iw * ih
+    inter = iw * ih
     areaA = max(0, ax2 - ax1) * max(0, ay2 - ay1)
     areaB = max(0, bx2 - bx1) * max(0, by2 - by1)
-    union = areaA + areaB - inter_area
-    return inter_area / union if union > 0 else 0.0
+    union = areaA + areaB - inter
+    return inter / union if union > 0 else 0.0
 
-# Simple track structure
 class Track:
     def __init__(self, box, conf, behavior=None, lesions=None, parts=None):
         self.box = tuple(map(int, box))
         self.conf = float(conf)
-        self.age = 1           # total frames seen
-        self.seen = 1          # consecutive seen count
-        self.lost = 0          # consecutive missed frames
+        self.age = 1
+        self.seen = 1
+        self.lost = 0
         self.confirmed = False
         self.behavior_votes = [] if behavior is None else [behavior]
         self.lesion_votes = lesions[:] if lesions else []
@@ -141,23 +146,22 @@ class Track:
         self.seen = 0
 
     def get_aggregate_behavior(self):
-        # majority vote if any
         if not self.behavior_votes:
             return None
-        vals = {}
+        counts = {}
         for b in self.behavior_votes:
             if b is None: continue
             k = b.lower()
-            vals[k] = vals.get(k, 0) + 1
-        if not vals:
+            counts[k] = counts.get(k, 0) + 1
+        if not counts:
             return None
-        return max(vals.items(), key=lambda x: x[1])[0]
+        return max(counts.items(), key=lambda x: x[1])[0]
 
-# -------------------------- Inference + tracking thread (main changes here) --------------------------
+# -------------------- Inference + tracking thread --------------------
 class InferenceThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
-        self.tracks = []   # list of Track objects
+        self.tracks = []
         self.proc_count = 0
 
     def safe_box_coords(self, box):
@@ -173,30 +177,25 @@ class InferenceThread(threading.Thread):
         return sharpened.astype("uint8")
 
     def filter_candidate(self, box, conf, frame_shape):
-        # Apply base filters: confidence, area, aspect ratio
         h_frame, w_frame = frame_shape[:2]
         x1, y1, x2, y2 = map(int, box)
         w = max(1, x2 - x1)
         h = max(1, y2 - y1)
         area = w * h
-        if conf < PIG_CONF_MIN:
-            return False
         frame_area = w_frame * h_frame
-        if area < (MIN_AREA_FRAC * frame_area):
+        # Relaxed filters: only filter very tiny boxes or extremely low conf
+        if conf < (PIG_CONF_MIN * 0.6):  # allow slightly lower confidences as candidates
+            return False
+        if area < (MIN_AREA_FRAC * frame_area * 0.5):  # allow even smaller as candidates
             return False
         ar = (w / h) if h > 0 else 0
-        if ar < ASPECT_RATIO_MIN or ar > ASPECT_RATIO_MAX:
+        if ar < (ASPECT_RATIO_MIN * 0.6) or ar > (ASPECT_RATIO_MAX * 1.4):
             return False
         return True
 
     def match_and_update_tracks(self, detections):
-        """
-        detections: list of dict {'box':(x1,y1,x2,y2), 'conf':float, 'behavior':str, 'lesions':[], 'parts':[]}
-        """
         matched = set()
-        # IoU threshold to consider same object
-        IOU_THRESH = 0.4
-        # First, try to match each detection to existing tracks
+        IOU_THRESH = 0.35  # slightly lower to match more
         for d in detections:
             best_iou = 0.0
             best_idx = None
@@ -206,21 +205,16 @@ class InferenceThread(threading.Thread):
                     best_iou = iouv
                     best_idx = i
             if best_iou >= IOU_THRESH and best_idx is not None:
-                # update matched track
                 tr = self.tracks[best_idx]
                 tr.update(d['box'], d['conf'], d.get('behavior'), d.get('lesions'), d.get('parts'))
                 matched.add(best_idx)
             else:
-                # create new track
                 nt = Track(d['box'], d['conf'], behavior=d.get('behavior'), lesions=d.get('lesions'), parts=d.get('parts'))
                 self.tracks.append(nt)
 
-        # Mark unmatched tracks as lost
         for i, tr in enumerate(self.tracks):
             if i not in matched:
                 tr.mark_lost()
-
-        # Remove tracks lost for too long
         self.tracks = [tr for tr in self.tracks if tr.lost <= MAX_TRACK_LOST]
 
     def produce_confirmed_results(self):
@@ -231,7 +225,7 @@ class InferenceThread(threading.Thread):
                     "box": tr.box,
                     "conf": tr.conf,
                     "behavior": tr.get_aggregate_behavior(),
-                    "lesions": tr.lesion_votes,   # raw aggregated boxes (may be many)
+                    "lesions": tr.lesion_votes,
                     "parts": tr.part_votes
                 })
         return results
@@ -251,7 +245,7 @@ class InferenceThread(threading.Thread):
             if self.proc_count % PROCESS_EVERY_N != 0:
                 continue
 
-            # frame_copy is RGB888; convert to BGR for OpenCV ops
+            # Convert RGB->BGR for OpenCV ops (frame from config is RGB888)
             frame_bgr = frame_copy[..., ::-1] if frame_copy.ndim == 3 and frame_copy.shape[2] == 3 else frame_copy
             frame_proc = frame_bgr.astype("uint8")
             if APPLY_SHARPEN:
@@ -259,10 +253,9 @@ class InferenceThread(threading.Thread):
                     frame_proc = self.unsharp_mask(frame_proc)
                 except Exception:
                     pass
-            # convert to RGB for model
             frame_rgb = frame_proc[..., ::-1]
 
-            # ---------- Pig detection ----------
+            # Pig detection
             try:
                 pig_results = pig_model.predict(source=frame_rgb, conf=PIG_CONF_MIN, imgsz=IMG_SIZE, save=False, show=False, verbose=False)
             except Exception as e:
@@ -270,8 +263,10 @@ class InferenceThread(threading.Thread):
                 time.sleep(0.01)
                 continue
 
-            # Collect candidate detections after applying per-box filters
             candidates = []
+            # We'll also keep raw candidate boxes for display
+            candidate_display = []
+
             for r in pig_results:
                 for box in r.boxes:
                     try:
@@ -284,9 +279,11 @@ class InferenceThread(threading.Thread):
                     if "pig" not in label.lower():
                         continue
                     coords = self.safe_box_coords(box)
+                    # relaxed filter for candidates
                     if not self.filter_candidate(coords, conf, frame_rgb.shape):
+                        # still add to candidate_display so you can see them if enabled
+                        candidate_display.append((coords, conf))
                         continue
-                    # clamp coords
                     x1, y1, x2, y2 = coords
                     h_frame, w_frame = frame_rgb.shape[:2]
                     x1, y1 = max(0, x1), max(0, y1)
@@ -295,12 +292,12 @@ class InferenceThread(threading.Thread):
                     if pig_crop.size == 0:
                         continue
 
-                    # ASF detection and behavior detection executed but will only be attached to track if track becomes confirmed
+                    # ASF detection
                     lesion_boxes = []
                     part_boxes = []
                     try:
                         asf_results = asf_model.predict(source=pig_crop, conf=CONF_ASF, imgsz=IMG_SIZE, save=False, show=False, verbose=False)
-                    except Exception as e:
+                    except Exception:
                         asf_results = []
                     for ar in asf_results:
                         for a_box in ar.boxes:
@@ -321,6 +318,7 @@ class InferenceThread(threading.Thread):
                             elif a_label.lower() in ["ear", "leg", "nose", "tail"]:
                                 part_boxes.append((ax1f, ay1f, ax2f, ay2f, a_label))
 
+                    # Behavior detection
                     behavior_label = None
                     try:
                         behavior_results = behavior_model.predict(source=pig_crop, conf=CONF_BEHAVIOR, imgsz=IMG_SIZE, save=False, show=False, verbose=False)
@@ -340,72 +338,117 @@ class InferenceThread(threading.Thread):
                         if behavior_label:
                             break
 
-                    candidates.append({
+                    cand = {
                         "box": (x1, y1, x2, y2),
                         "conf": conf,
                         "behavior": behavior_label,
                         "lesions": lesion_boxes,
                         "parts": part_boxes
-                    })
+                    }
+                    candidates.append(cand)
+                    candidate_display.append(( (x1,y1,x2,y2), conf ))
 
-            # Match candidates into tracks & produce confirmed results
+            # Match candidates -> tracks and produce confirmed results
+            self.match_and_update_tracks = self.match_and_update_tracks if hasattr(self, "match_and_update_tracks") else InferenceThread.match_and_update_tracks
             self.match_and_update_tracks(candidates)
             confirmed = self.produce_confirmed_results()
-
-            # Write confirmed detections to shared results for display
             with shared_lock:
                 shared["latest_results"] = confirmed
+                shared["latest_candidates"] = candidate_display if SHOW_CANDIDATES else []
                 shared["results_ts"] = time.time()
-
-            # tiny sleep
             time.sleep(0.001)
 
-# -------------------------- Display helpers (unchanged) --------------------------
-def draw_label_small(img, box, label, color=(0,255,0)):
+# we need to attach method match_and_update_tracks defined earlier (reuse from prior code)
+def _match_and_update_tracks(self, detections):
+    matched = set()
+    IOU_THRESH = 0.35
+    for d in detections:
+        best_iou = 0.0
+        best_idx = None
+        for i, tr in enumerate(self.tracks):
+            iouv = iou(d['box'], tr.box)
+            if iouv > best_iou:
+                best_iou = iouv
+                best_idx = i
+        if best_iou >= IOU_THRESH and best_idx is not None:
+            tr = self.tracks[best_idx]
+            tr.update(d['box'], d['conf'], d.get('behavior'), d.get('lesions'), d.get('parts'))
+            matched.add(best_idx)
+        else:
+            nt = Track(d['box'], d['conf'], behavior=d.get('behavior'), lesions=d.get('lesions'), parts=d.get('parts'))
+            self.tracks.append(nt)
+    for i, tr in enumerate(self.tracks):
+        if i not in matched:
+            tr.mark_lost()
+    self.tracks = [tr for tr in self.tracks if tr.lost <= MAX_TRACK_LOST]
+
+# attach to InferenceThread
+InferenceThread.match_and_update_tracks = _match_and_update_tracks
+InferenceThread.produce_confirmed_results = InferenceThread.produce_confirmed_results
+
+# -------------------- Display helpers --------------------
+def draw_label_small(img, box, label, color=(0,255,0), thickness=1):
     x1, y1, x2, y2 = map(int, box)
-    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
     cv2.putText(img, label, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
+# translucent rectangle helper
+def draw_translucent_box(img, box, color=(0,255,255), alpha=0.25):
+    x1, y1, x2, y2 = map(int, box)
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
+
+# -------------------- Main display loop --------------------
 def main():
     cam_thread = CameraThread(cap_size=CAPTURE_SIZE)
     infer_thread = InferenceThread()
     cam_thread.start()
     infer_thread.start()
-    time.sleep(0.3)  # warm up
+    time.sleep(0.3)
 
     try:
         while True:
             with shared_lock:
                 frame = shared.get("latest_frame", None)
                 results = list(shared.get("latest_results", []))
+                candidates = list(shared.get("latest_candidates", []))
             if frame is None:
                 time.sleep(0.005)
                 continue
 
             frame_bgr = frame[..., ::-1] if frame.ndim == 3 and frame.shape[2] == 3 else frame
             disp = cv2.resize(frame_bgr, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
-
             cap_w, cap_h = CAPTURE_SIZE
             disp_w, disp_h = DISPLAY_SIZE
             sx = disp_w / cap_w
             sy = disp_h / cap_h
 
-            # draw only confirmed tracks (results)
+            # draw candidates (light/translucent)
+            for (cbox, cconf) in candidates:
+                cx1, cy1, cx2, cy2 = cbox
+                sb = (int(cx1 * sx), int(cy1 * sy), int(cx2 * sx), int(cy2 * sy))
+                draw_translucent_box(disp, sb, color=(255,200,0), alpha=0.15)
+                # small label for candidate
+                cv2.putText(disp, f"cand:{cconf:.2f}", (sb[0], max(12, sb[1]-2)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,200,0), 1)
+
+            # draw confirmed results (solid, same as before)
             for r in results:
                 bx1, by1, bx2, by2 = r["box"]
                 sb = (int(bx1 * sx), int(by1 * sy), int(bx2 * sx), int(by2 * sy))
                 behavior = r.get("behavior", None)
                 label = f"pig-{r['conf']:.2f}" + (f"-{behavior}" if behavior else "")
-                draw_label_small(disp, sb, label, color=(0,255,0))
+                draw_label_small(disp, sb, label, color=(0,255,0), thickness=2)
                 for lesion in r.get("lesions", []):
                     lb = (int(lesion[0]*sx), int(lesion[1]*sy), int(lesion[2]*sx), int(lesion[3]*sy))
-                    draw_label_small(disp, lb, "possible lesion", color=(0,0,255))
+                    draw_label_small(disp, lb, "lesion", color=(0,0,255), thickness=1)
                 for part in r.get("parts", []):
                     pb = (int(part[0]*sx), int(part[1]*sy), int(part[2]*sx), int(part[3]*sy))
-                    draw_label_small(disp, pb, part[4], color=(255,128,0))
+                    draw_label_small(disp, pb, part[4], color=(255,128,0), thickness=1)
 
-            cv2.putText(disp, f"CAP: {CAPTURE_SIZE[0]}x{CAPTURE_SIZE[1]} IMG:{IMG_SIZE}", (8, disp.shape[0]-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
-            cv2.imshow("Pig + ASF + Behavior (robust detect)", disp)
+            cv2.putText(disp, f"CAP:{CAPTURE_SIZE[0]}x{CAPTURE_SIZE[1]} IMG:{IMG_SIZE}", (8, disp.shape[0]-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
+            cv2.imshow("Pig + ASF + Behavior (relaxed detect)", disp)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
             time.sleep(0.001)
@@ -422,3 +465,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
