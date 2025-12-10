@@ -1,33 +1,35 @@
-# optimized_threads_display_RPI_LiveDet.py
-# python optimized_threads_display_RPI_LiveDet.py
+# optimized_camera_focus_RPI_LiveDet.py
+# python optimized_camera_focus_RPI_LiveDet.py
+#
+# Pi4 + Camera Module 3 targeted: balanced accuracy and display FPS (1-3 FPS target).
+# Continuous autofocus enabled; video configuration used; mild unsharp mask applied before inference.
 
-import os
 import time
 import threading
 import cv2
 import torch
 from ultralytics import YOLO
 from picamera2 import Picamera2
+from libcamera import controls
 
-# -------------------------- PyTorch 2.6+ weights fix --------------------------
+# -------------------------- PyTorch 2.6+ fix (keeps your wrapper) --------------------------
 orig_torch_load = torch.load
 def torch_load_wrapper(*args, **kwargs):
     kwargs["weights_only"] = False
     return orig_torch_load(*args, **kwargs)
 torch.load = torch_load_wrapper
 
-# -------------------------- Tunable knobs --------------------------
-# Experience: start with these values. Lower imgsz => faster inference but less detail.
-CAPTURE_SIZE = (960, 544)     # (w,h) camera capture size. Lower this to reduce data move overhead.
-IMG_SIZE = 480                # model imgsz (passed to predict). Try 480 -> 320 if you need more speed.
-DISPLAY_SIZE = (640, 360)     # small display size for fast imshow/drawing
-PROCESS_EVERY_N = 1           # inference will try to process latest frame every loop
+# -------------------------- Tunable knobs (balanced defaults) --------------------------
+CAPTURE_SIZE = (1280, 720)   # (w,h) capture — increased for objects 1-3m away
+IMG_SIZE = 640               # model input size (imgsz) — keep 640 for accuracy, lower for speed
+DISPLAY_SIZE = (800, 450)    # display copy size (fast to draw)
+PROCESS_EVERY_N = 1          # inference throttle: 1 = every frame from buffer
 CONF_PIG = 0.30
 CONF_ASF = 0.50
 CONF_BEHAVIOR = 0.50
+APPLY_SHARPEN = True         # mild unsharp mask before inference (helps slight soft images)
 
-# Display FPS target you asked for: 1 - 3 FPS (we aim to display as fast as possible)
-# -------------------------- Model paths --------------------------
+# -------------------------- Model paths (adjust if needed) --------------------------
 MODEL_ASF_PATH = "/home/asfrotect/Downloads/best(ASF_MODEL)_.pt"
 MODEL_BEHAVIOR_PATH = "/home/asfrotect/Downloads/best(BEHAVIOR_MODEL)_.pt"
 MODEL_PIG_PATH = "/home/asfrotect/Downloads/pig_vs_non_pig.v3.pt"
@@ -39,25 +41,31 @@ behavior_model = YOLO(MODEL_BEHAVIOR_PATH)
 print("Models loaded.")
 
 # -------------------------- Shared state --------------------------
-# latest_frame: holds the latest full-res frame captured by camera thread
-# latest_results: list of detection results (pig boxes + per-pig ASF + behavior labels) produced by inference thread
 shared = {
     "latest_frame": None,
-    "latest_results": [],   # list of dicts: { 'box':(x1,y1,x2,y2), 'conf':float, 'behavior':str, 'lesions':[...], 'parts':[...]}
-    "frame_ts": 0.0
+    "latest_results": [],
+    "frame_ts": 0.0,
+    "results_ts": 0.0
 }
 shared_lock = threading.Lock()
 stop_event = threading.Event()
 
-# -------------------------- Camera thread --------------------------
+# -------------------------- Camera thread (video config + autofocus) --------------------------
 class CameraThread(threading.Thread):
-    def __init__(self, cap_size=(960,544)):
+    def __init__(self, cap_size=(1280,720), framerate=30):
         super().__init__(daemon=True)
         self.picam2 = Picamera2()
-        # use preview configuration (fast)
-        self.config = self.picam2.create_preview_configuration(main={"format":"XRGB8888","size":cap_size})
+        # video configuration for better ISP processing
+        self.config = self.picam2.create_video_configuration(main={"format": "RGB888", "size": cap_size})
         self.picam2.configure(self.config)
         self.picam2.start()
+        # enable continuous autofocus if supported
+        try:
+            self.picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+            print("Autofocus set: Continuous")
+        except Exception as e:
+            print("Autofocus enable failed (platform may not support):", e)
+        # optional: tweak exposure / gain if you want more control
         self.stopped = False
 
     def run(self):
@@ -68,10 +76,10 @@ class CameraThread(threading.Thread):
                     time.sleep(0.005)
                     continue
                 with shared_lock:
-                    shared["latest_frame"] = frame   # keep full resolution frame (CAPTURE_SIZE)
+                    shared["latest_frame"] = frame
                     shared["frame_ts"] = time.time()
-            except Exception:
-                # avoid tight loop on camera errors
+            except Exception as e:
+                print("Camera capture error:", e)
                 time.sleep(0.01)
 
     def stop(self):
@@ -81,56 +89,71 @@ class CameraThread(threading.Thread):
         except Exception:
             pass
 
-# -------------------------- Inference thread --------------------------
+# -------------------------- Inference thread (keeps your detection logic) --------------------------
 class InferenceThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.proc_count = 0
 
-    def safe_box_info(self, box):
-        # helper to extract ints from ultralytics box
+    def safe_box_coords(self, box):
+        # extract ints from ultralytics box
         try:
             coords = list(map(int, box.xyxy[0]))
         except Exception:
-            # fallback if format slightly different
             coords = [int(x) for x in box.xyxy]
         return coords
+
+    def unsharp_mask(self, img):
+        # mild sharpening: keep it conservative to avoid introducing artifacts
+        # img : uint8 BGR
+        blurred = cv2.GaussianBlur(img, (0,0), sigmaX=3, sigmaY=3)
+        sharpened = cv2.addWeighted(img, 1.3, blurred, -0.3, 0)
+        # clip to uint8
+        sharpened = sharpened.astype("uint8")
+        return sharpened
 
     def run(self):
         global pig_model, asf_model, behavior_model
         while not stop_event.is_set():
-            frame_for_infer = None
+            frame_copy = None
             with shared_lock:
                 if shared["latest_frame"] is not None:
-                    # copy pointer (we will copy to avoid holding lock)
-                    frame_for_infer = shared["latest_frame"].copy()
-            if frame_for_infer is None:
+                    frame_copy = shared["latest_frame"].copy()
+            if frame_copy is None:
                 time.sleep(0.005)
                 continue
 
-            # Optionally throttle inference if desired (we keep PROCESS_EVERY_N support)
             self.proc_count += 1
             if self.proc_count % PROCESS_EVERY_N != 0:
                 continue
 
-            # Convert XRGB/4-channel -> BGR 3-channel if needed
-            if frame_for_infer.ndim == 3 and frame_for_infer.shape[2] == 4:
-                frame_proc = frame_for_infer[..., :3]
-            else:
-                frame_proc = frame_for_infer
+            # Convert to BGR 3-channel if needed (frame is RGB888 from config)
+            # Ultralytics accepts RGB; we'll pass BGR->RGB conversion when needed.
+            # Our models behave with either but to be safe convert to BGR for OpenCV ops, then to RGB for model.
+            frame_bgr = frame_copy[..., ::-1] if frame_copy.ndim == 3 and frame_copy.shape[2] == 3 else frame_copy
 
-            frame_proc = frame_proc.astype('uint8')
+            frame_proc = frame_bgr.astype("uint8")
 
-            # ---------- Pig detection (full-frame) ----------
+            # Mild sharpen to help slightly soft lens results (optional)
+            if APPLY_SHARPEN:
+                try:
+                    frame_proc = self.unsharp_mask(frame_proc)
+                except Exception as e:
+                    # fall back to original on errors
+                    print("Sharpen error:", e)
+
+            # Convert to RGB for Ultralytics (YOLO) if necessary
+            frame_rgb = frame_proc[..., ::-1]
+
+            # ---------- Pig detection on full-res frame ----------
             try:
-                pig_results = pig_model.predict(source=frame_proc, conf=CONF_PIG, imgsz=IMG_SIZE, save=False, show=False, verbose=False)
+                pig_results = pig_model.predict(source=frame_rgb, conf=CONF_PIG, imgsz=IMG_SIZE, save=False, show=False, verbose=False)
             except Exception as e:
-                # if predict fails, skip this cycle and continue
                 print("Pig predict error:", e)
                 time.sleep(0.01)
                 continue
 
-            local_results = []  # fill with per-pig dicts
+            results_accum = []
 
             for r in pig_results:
                 for box in r.boxes:
@@ -146,18 +169,15 @@ class InferenceThread(threading.Thread):
                     if "pig" not in label.lower():
                         continue
 
-                    coords = self.safe_box_info(box)  # [x1,y1,x2,y2]
-                    x1, y1, x2, y2 = coords
-                    # clamp
-                    h_frame, w_frame = frame_proc.shape[:2]
+                    x1, y1, x2, y2 = self.safe_box_coords(box)
+                    h_frame, w_frame = frame_rgb.shape[:2]
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(w_frame - 1, x2), min(h_frame - 1, y2)
-
-                    pig_crop = frame_proc[y1:y2, x1:x2]
+                    pig_crop = frame_rgb[y1:y2, x1:x2]
                     if pig_crop.size == 0:
                         continue
 
-                    # ---------- ASF detection on pig_crop ----------
+                    # ---------- ASF detection ----------
                     lesion_boxes = []
                     part_boxes = []
                     try:
@@ -177,16 +197,16 @@ class InferenceThread(threading.Thread):
                             if a_conf < CONF_ASF:
                                 continue
                             a_label = ar.names[a_cls]
-                            ax1, ay1, ax2, ay2 = self.safe_box_info(a_box)
-                            # map back to full frame coords
-                            ax1_full, ay1_full = ax1 + x1, ay1 + y1
-                            ax2_full, ay2_full = ax2 + x1, ay2 + y1
+                            ax1, ay1, ax2, ay2 = self.safe_box_coords(a_box)
+                            # Map back to full-frame coordinates
+                            ax1f, ay1f = ax1 + x1, ay1 + y1
+                            ax2f, ay2f = ax2 + x1, ay2 + y1
                             if "lesion" in a_label.lower():
-                                lesion_boxes.append((ax1_full, ay1_full, ax2_full, ay2_full))
+                                lesion_boxes.append((ax1f, ay1f, ax2f, ay2f))
                             elif a_label.lower() in ["ear", "leg", "nose", "tail"]:
-                                part_boxes.append((ax1_full, ay1_full, ax2_full, ay2_full, a_label))
+                                part_boxes.append((ax1f, ay1f, ax2f, ay2f, a_label))
 
-                    # ---------- Behavior detection on pig_crop ----------
+                    # ---------- Behavior detection ----------
                     behavior_label = None
                     try:
                         behavior_results = behavior_model.predict(source=pig_crop, conf=CONF_BEHAVIOR, imgsz=IMG_SIZE, save=False, show=False, verbose=False)
@@ -208,7 +228,7 @@ class InferenceThread(threading.Thread):
                         if behavior_label:
                             break
 
-                    local_results.append({
+                    results_accum.append({
                         "box": (x1, y1, x2, y2),
                         "conf": float(conf),
                         "behavior": behavior_label,
@@ -216,104 +236,94 @@ class InferenceThread(threading.Thread):
                         "parts": part_boxes
                     })
 
-            # write results back to shared safely
             with shared_lock:
-                shared["latest_results"] = local_results
+                shared["latest_results"] = results_accum
                 shared["results_ts"] = time.time()
 
-            # small sleep to avoid 100% CPU (inference itself is slow; this only limits loop when inference is quick)
-            # tune or remove as needed
+            # tiny sleep to yield
             time.sleep(0.001)
 
 # -------------------------- Fast display helpers --------------------------
 def draw_label_small(img, box, label, color=(0,255,0)):
     x1, y1, x2, y2 = map(int, box)
     cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(img, label, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    cv2.putText(img, label, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
 def box_inside(boxA, boxB):
     ax1, ay1, ax2, ay2 = map(int, boxA)
     bx1, by1, bx2, by2 = map(int, boxB)
     return ax1 >= bx1 and ay1 >= by1 and ax2 <= bx2 and ay2 <= by2
 
-# -------------------------- Main (display) loop --------------------------
+# -------------------------- Main display loop --------------------------
 def main():
     cam_thread = CameraThread(cap_size=CAPTURE_SIZE)
     infer_thread = InferenceThread()
     cam_thread.start()
     infer_thread.start()
-    time.sleep(0.2)  # warm up
+    time.sleep(0.3)  # warm up
 
-    last_disp_time = time.time()
-    display_count = 0
     try:
+        last_display_ts = time.time()
+        disp_count = 0
         while True:
-            # get latest captured frame (full-res) quickly
             with shared_lock:
                 frame = shared.get("latest_frame", None)
-                results = list(shared.get("latest_results", []))  # shallow copy
+                results = list(shared.get("latest_results", []))
                 frame_ts = shared.get("frame_ts", 0.0)
+                results_ts = shared.get("results_ts", 0.0)
 
             if frame is None:
                 time.sleep(0.005)
                 continue
 
-            # Convert XRGB -> BGR if needed and make a small display copy
-            if frame.ndim == 3 and frame.shape[2] == 4:
-                frame_bgr = frame[..., :3]
-            else:
-                frame_bgr = frame
+            # frame is RGB888 — convert to BGR for OpenCV display
+            frame_bgr = frame[..., ::-1] if frame.ndim == 3 and frame.shape[2] == 3 else frame
 
-            # Resize to DISPLAY_SIZE for faster drawing & imshow
+            # Resize to display for fast drawing
             disp = cv2.resize(frame_bgr, DISPLAY_SIZE, interpolation=cv2.INTER_LINEAR)
 
-            # We must scale boxes from CAPTURE_SIZE -> DISPLAY_SIZE before drawing.
+            # Scale factors from capture -> display
             cap_w, cap_h = CAPTURE_SIZE
             disp_w, disp_h = DISPLAY_SIZE
             sx = disp_w / cap_w
             sy = disp_h / cap_h
 
-            # Draw most recent results (which were computed on full-res frames)
+            # Draw detections (scale boxes down)
             for r in results:
                 bx1, by1, bx2, by2 = r["box"]
-                # scale
                 sb = (int(bx1 * sx), int(by1 * sy), int(bx2 * sx), int(by2 * sy))
                 behavior = r.get("behavior", None)
                 label = f"pig-{r['conf']:.2f}" + (f"-{behavior.lower()}" if behavior else "")
                 draw_label_small(disp, sb, label, color=(0,255,0))
-                # lesions
+
                 for lesion in r.get("lesions", []):
                     lb = (int(lesion[0]*sx), int(lesion[1]*sy), int(lesion[2]*sx), int(lesion[3]*sy))
                     draw_label_small(disp, lb, "possible lesion", color=(0,0,255))
-                # parts (small tag)
+
                 for part in r.get("parts", []):
                     pb = (int(part[0]*sx), int(part[1]*sy), int(part[2]*sx), int(part[3]*sy))
                     draw_label_small(disp, pb, part[4], color=(255,128,0))
 
-            # Compute display FPS (fast rolling)
+            # Overlay status info
             now = time.time()
-            display_count += 1
-            if now - last_disp_time >= 1.0:
-                # show an approximate FPS in window title or on image
-                # (we simply reset counter every second)
-                last_disp_time = now
-                display_count = 0
+            cv2.putText(disp, f"Display: {time.strftime('%H:%M:%S')}", (8, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
+            cv2.putText(disp, f"CAP: {CAPTURE_SIZE[0]}x{CAPTURE_SIZE[1]} IMG: {IMG_SIZE}", (8, disp.shape[0]-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
 
-            # put a small FPS/ts overlay
-            cv2.putText(disp, f"Display@ {time.strftime('%H:%M:%S')}", (8, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-
-            cv2.imshow("Pig + ASF + Behavior (fast display)", disp)
-            if cv2.waitKey(1) & 0xFF == 27:  # ESC
+            cv2.imshow("Pig + ASF + Behavior (focused capture)", disp)
+            if cv2.waitKey(1) & 0xFF == 27:
                 break
 
-            # tiny sleep to yield (adjustable)
+            # small yield
             time.sleep(0.001)
 
     except KeyboardInterrupt:
         pass
     finally:
         stop_event.set()
-        cam_thread.stop()
+        try:
+            cam_thread.stop()
+        except Exception:
+            pass
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
