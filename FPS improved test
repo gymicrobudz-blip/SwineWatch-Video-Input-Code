@@ -68,7 +68,7 @@ skin_in,skin_out = skin_itp.get_input_details(),skin_itp.get_output_details()
 # ================= CAMERA =================
 picam2 = Picamera2()
 picam2.configure(picam2.create_preview_configuration(
-    main={"format":"BGR888","size":(640,480)}
+    main={"format":"RGB888","size":(640,480)}
 ))
 picam2.start()
 
