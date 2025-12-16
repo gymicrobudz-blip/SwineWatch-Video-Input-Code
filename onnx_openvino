@@ -24,9 +24,34 @@ CONF_THRES = 0.3
 # -------------------------- OpenVINO INIT --------------------------
 ie = Core()
 
-pig_compiled = ie.compile_model(ie.read_model(PIG_MODEL_ONNX), "CPU")
-asf_compiled = ie.compile_model(ie.read_model(ASF_MODEL_ONNX), "CPU")
-behavior_compiled = ie.compile_model(ie.read_model(BEHAVIOR_MODEL_ONNX), "CPU")
+pig_compiled = ie.compile_model(
+    ie.read_model(PIG_MODEL_ONNX),
+    "CPU",
+    {
+        "CPU_THREADS_NUM": "4",
+        "CPU_BIND_THREAD": "NO",
+        "CPU_THROUGHPUT_STREAMS": "1"
+    }
+)
+
+asf_compiled = ie.compile_model(
+    ie.read_model(ASF_MODEL_ONNX),
+    "CPU",
+    {
+        "CPU_THREADS_NUM": "4",
+        "CPU_BIND_THREAD": "NO",
+        "CPU_THROUGHPUT_STREAMS": "1"
+    }
+)
+behavior_compiled = ie.compile_model(
+    ie.read_model(BEHAVIOR_MODEL_ONNX),
+    "CPU",
+    {
+        "CPU_THREADS_NUM": "4",
+        "CPU_BIND_THREAD": "NO",
+        "CPU_THROUGHPUT_STREAMS": "1"
+    }
+)
 
 pig_input = pig_compiled.input(0)
 pig_output = pig_compiled.output(0)
