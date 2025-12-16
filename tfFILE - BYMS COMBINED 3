@@ -1,165 +1,126 @@
-mport cv2
-import numpy as np
-import tflite_runtime.interpreter as tf
-import time
-import math
-
-from picamera2 import Picamera2
-
-# ================= CONFIG =================
-IMG_SIZE = 416
-
-PIG_MODEL = r"/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/PigvsNONPig-v2_float16.tflite"
-BEHAVIOR_MODEL = r"/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/bestv8_behavior-2_float16.tflite"
-SKIN_MODEL = r"/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/ASFskin_NoPartsv3_v8s.tflite"
-
-PIG_CLASS_ID = 7
-PIG_CONF = 0.50
-BEHAVIOR_INTERVAL = 3
-SKIN_INTERVAL = 4
-SKIN_CONF = 0.45
-
-MAX_MISSED = 10
-
-# ================= LABELS =================
-BEHAVIOR_NAMES = {
-    0: "ACTIVE",
-    1: "EATING",
-    2: "GROUP",
-    3: "INACTIVE"
-}
-
-SKIN_NAMES = {
-    1: "ASF LESION",
-    2: "REDNESS"
-}
-
-# ================= HELPERS =================
-def preprocess(img):
-    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype(np.float32) / 255.0
-    return img[np.newaxis, ...]
-
-def compute_iou(a, b):
-    xA, yA = max(a[0], b[0]), max(a[1], b[1])
-    xB, yB = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0, xB - xA) * max(0, yB - yA)
-    areaA = max(0, a[2]-a[0]) * max(0, a[3]-a[1])
-    areaB = max(0, b[2]-b[0]) * max(0, b[3]-b[1])
-    return inter / (areaA + areaB - inter + 1e-6)
-
-def center_dist(a, b):
-    ax = (a[0] + a[2]) / 2
-    ay = (a[1] + a[3]) / 2
-    bx = (b[0] + b[2]) / 2
-    by = (b[1] + b[3]) / 2
-    return math.hypot(ax - bx, ay - by)
-
-def nms(dets, thresh):
-    dets = sorted(dets, key=lambda x: x[1], reverse=True)
-    keep = []
-    while dets:
-        best = dets.pop(0)
-        keep.append(best)
-        dets = [d for d in dets if compute_iou(best[0], d[0]) < thresh]
-    return keep
-
-def load_model(path):
-    itp = Interpreter(model_path=path)
-    itp.allocate_tensors()
-    return itp
-
-
-# ================= PIG TRACKER =================
-class StablePigTracker:
-    def __init__(self):
-        self.tracks = {}
-        self.next_id = 1
-
-    def update(self, detections):
-        updated = {}
-        used = set()
-
-        for pid, trk in self.tracks.items():
-            best_i, best_d = -1, 1e9
-            for i, (box, conf) in enumerate(detections):
-                if i in used:
-                    continue
-                d = center_dist(trk["box"], box)
-                if d < best_d:
-                    best_d = d
-                    best_i = i
-
-            if best_i != -1:
-                box, conf = detections[best_i]
-                updated[pid] = {
-                    "box": box,
-                    "conf": conf,
-                    "behavior": trk.get("behavior", "INACTIVE"),
-                    "pending": trk.get("pending"),
-                    "missed": 0
-                }
-                used.add(best_i)
-            else:
-                trk["missed"] += 1
-                if trk["missed"] <= MAX_MISSED:
-                    updated[pid] = trk
-
-        for i, (box, conf) in enumerate(detections):
-            if i not in used:
-                updated[self.next_id] = {
-                    "box": box,
-                    "conf": conf,
-                    "behavior": "INACTIVE",
-                    "pending": None,
-                    "missed": 0
-                }
-                self.next_id += 1
-
-        self.tracks = updated
-        return self.tracks
-
-# ================= LOAD MODELS =================
-pig_itp = load_model(PIG_MODEL)
-beh_itp = load_model(BEHAVIOR_MODEL)
-skin_itp = load_model(SKIN_MODEL)
-
-pig_in, pig_out = pig_itp.get_input_details(), pig_itp.get_output_details()
-beh_in, beh_out = beh_itp.get_input_details(), beh_itp.get_output_details()
-skin_in, skin_out = skin_itp.get_input_details(), skin_itp.get_output_details()
-
-# ================= PI CAMERA (ONLY CHANGE) =================
-picam2 = Picamera2()
-config = picam2.create_preview_configuration(
-    main={"format": "BGR888", "size": (640, 480)}
-)
-picam2.configure(config)
-picam2.start()
-
-tracker = StablePigTracker()
-frame_id = 0
-fps_time = time.time()
-fps_buffer = []
-cached_skin_outs = []
-
 # ================= MAIN LOOP =================
 while True:
-    frame = picam2.capture_array()
+    ret, frame = cap.read()
+    if not ret:
+        break
+
     frame_id += 1
     H, W, _ = frame.shape
 
-    # ---- EVERYTHING BELOW IS 100% UNCHANGED ----
-    # (pig detection, tracking, behavior, skin, FPS, display)
-    # YOUR ORIGINAL PIPELINE IS PRESERVED
-    # --------------------------------------------
+    pigs = []
+    human_boxes = []
 
-    # [NO CHANGES MADE HERE â€“ omitted for brevity]
-    # your exact loop body continues...
+    # -------- PIG + HUMAN DETECTION --------
+    pig_itp.set_tensor(pig_in[0]['index'], preprocess(frame))
+    pig_itp.invoke()
+    preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
 
-    cv2.imshow("ASF â€“ PIG TRACKING + SKIN DETECTION", frame)
+    for d in preds:
+        x, y, bw, bh = d[:4]
+        scores = d[4:]
+        cid = int(np.argmax(scores))
+        conf = float(scores[cid])
+
+        if conf < PIG_CONF:
+            continue
+
+        x1 = int((x - bw/2) * W)
+        y1 = int((y - bh/2) * H)
+        x2 = int((x + bw/2) * W)
+        y2 = int((y + bh/2) * H)
+
+        if cid == PIG_CLASS_ID:
+            pigs.append(((x1,y1,x2,y2), conf))
+        elif cid == HUMAN_CLASS_ID:
+            human_boxes.append((x1,y1,x2,y2))
+
+    pigs = nms(pigs, 0.4)
+    pig_count = len(pigs)
+
+    # -------- BEHAVIOR --------
+    for (x1,y1,x2,y2), pconf in pigs:
+        roi = frame[max(0,y1):min(H,y2), max(0,x1):min(W,x2)]
+        if roi.size == 0:
+            continue
+
+        if frame_id % BEHAVIOR_INTERVAL == 0:
+            beh_itp.set_tensor(beh_in[0]['index'], preprocess(roi))
+            beh_itp.invoke()
+            outs = beh_itp.get_tensor(beh_out[0]['index'])[0].T
+            best = max(outs, key=lambda d: max(d[4:]))
+            last_behavior = BEHAVIOR_NAMES[int(np.argmax(best[4:]))]
+
+        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
+        cv2.putText(
+            frame,
+            f"PIG {pconf:.2f} | {last_behavior}",
+            (x1, max(0,y1-8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,   # smaller
+            (0,255,0),
+            1      # thinner
+        )
+
+    # -------- SKIN DETECTION (HUMAN-BLOCKED) --------
+    if frame_id % SKIN_INTERVAL == 0:
+        skin_itp.set_tensor(skin_in[0]['index'], preprocess(frame))
+        skin_itp.invoke()
+        outs = skin_itp.get_tensor(skin_out[0]['index'])[0].T
+
+        skin_raw = []
+        for d in outs:
+            x, y, bw, bh = d[:4]
+            scores = d[4:]
+            cid = int(np.argmax(scores))
+            conf = float(scores[cid])
+
+            if cid not in SKIN_NAMES or conf < SKIN_CONF:
+                continue
+
+            x1 = int((x - bw/2) * W)
+            y1 = int((y - bh/2) * H)
+            x2 = int((x + bw/2) * W)
+            y2 = int((y + bh/2) * H)
+
+            skin_raw.append(((x1,y1,x2,y2), conf, cid))
+
+        skin_kept = []
+        for box, conf, cid in skin_raw:
+            if overlaps_any(box, human_boxes):
+                continue
+            skin_kept.append((box, conf, cid))
+
+        skin_kept = nms([(b,c) for b,c,_ in skin_kept], 0.4)
+
+        for (x1,y1,x2,y2), conf in skin_kept:
+            cv2.rectangle(frame,(x1,y1),(x2,y2),(0,0,255),2)
+            cv2.putText(
+                frame,
+                f"{SKIN_NAMES[cid]} {conf:.2f}",
+                (x1,y1-4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,   # smaller
+                (0,0,255),
+                1
+            )
+
+    # -------- FPS + COUNT --------
+    now = time.time()
+    fps = 1.0 / max(1e-6, now - fps_time)
+    fps_time = now
+
+    cv2.putText(
+        frame, f"FPS: {fps:.1f}", (10,30),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,255), 2
+    )
+    cv2.putText(
+        frame, f"PIGS: {pig_count}", (150,30),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,0), 2
+    )
+
+    cv2.imshow("ASF COMBINED – HUMAN BLOCKED", frame)
     if cv2.waitKey(1) == 27:
         break
 
-picam2.stop()
+cap.release()
 cv2.destroyAllWindows()
