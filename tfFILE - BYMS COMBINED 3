@@ -1,6 +1,6 @@
-import cv2
+mport cv2
 import numpy as np
-import tensorflow as tf
+import tflite_runtime.interpreter as tf
 import time
 import math
 
@@ -9,9 +9,9 @@ from picamera2 import Picamera2
 # ================= CONFIG =================
 IMG_SIZE = 416
 
-PIG_MODEL = r"/home/pi/models/PigvsNONPig-v2_float16.tflite"
-BEHAVIOR_MODEL = r"/home/pi/models/bestv8_behavior-2_float16.tflite"
-SKIN_MODEL = r"/home/pi/models/ASFskin_NoPartsv3_v8s.tflite"
+PIG_MODEL = r"/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/PigvsNONPig-v2_float16.tflite"
+BEHAVIOR_MODEL = r"/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/bestv8_behavior-2_float16.tflite"
+SKIN_MODEL = r"/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/ASFskin_NoPartsv3_v8s.tflite"
 
 PIG_CLASS_ID = 7
 PIG_CONF = 0.50
@@ -66,9 +66,10 @@ def nms(dets, thresh):
     return keep
 
 def load_model(path):
-    itp = tf.lite.Interpreter(model_path=path)
+    itp = Interpreter(model_path=path)
     itp.allocate_tensors()
     return itp
+
 
 # ================= PIG TRACKER =================
 class StablePigTracker:
@@ -153,10 +154,10 @@ while True:
     # YOUR ORIGINAL PIPELINE IS PRESERVED
     # --------------------------------------------
 
-    # [NO CHANGES MADE HERE – omitted for brevity]
+    # [NO CHANGES MADE HERE â€“ omitted for brevity]
     # your exact loop body continues...
 
-    cv2.imshow("ASF – PIG TRACKING + SKIN DETECTION", frame)
+    cv2.imshow("ASF â€“ PIG TRACKING + SKIN DETECTION", frame)
     if cv2.waitKey(1) == 27:
         break
 
