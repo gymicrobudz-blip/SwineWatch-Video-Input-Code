@@ -5,17 +5,14 @@ from tflite_runtime.interpreter import Interpreter
 from picamera2 import Picamera2
 
 # ================= CONFIG =================
-# ---- MODELS ----
 PIG_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/PigvsNonPig.320.v3_v8s.tflite"
 BEHAVIOR_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/Behavior.320.v8_v8s.tflite"
 SKIN_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/ASFskin_NoPartsv3_v8s.tflite"
 
-# ---- INPUT SIZES ----
 PIG_SIZE = 320
 BEH_SIZE = 320
 SKIN_SIZE = 416
 
-# ---- THRESHOLDS ----
 PIG_CONF = 0.45
 BEH_CONF = 0.40
 SKIN_CONF = 0.35
@@ -23,12 +20,10 @@ SKIN_CONF = 0.35
 PIG_IOU = 0.40
 SKIN_IOU = 0.25
 
-# ---- FRAME SKIPS ----
 SKIP_PIG = 3
 SKIP_BEH = 6
 SKIP_SKIN = 8
 
-# ---- SKIN VISIBILITY ----
 SKIN_HOLD_FRAMES = 7
 
 PIG_CLASS_ID = 7
@@ -49,7 +44,6 @@ SKIN_NAMES = {
 # ================= HELPERS =================
 def preprocess(img, size):
     img = cv2.resize(img, (size, size))
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     img = img.astype(np.float32) / 255.0
     return img[np.newaxis, ...]
 
@@ -92,7 +86,6 @@ config = picam2.create_preview_configuration(
 picam2.configure(config)
 picam2.start()
 
-# ================= STATE =================
 frame_id = 0
 fps_time = time.time()
 fps_buffer = []
@@ -104,7 +97,9 @@ skin_memory = []
 
 # ================= MAIN LOOP =================
 while True:
-    frame = picam2.capture_array()
+    frame = picam2.capture_array()          # RGB frame
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # for display
+
     frame_id += 1
     H, W, _ = frame.shape
 
@@ -112,7 +107,7 @@ while True:
     if frame_id % SKIP_PIG == 0:
         pig_itp.set_tensor(
             pig_in[0]['index'],
-            preprocess(frame, PIG_SIZE)
+            preprocess(frame.copy(), PIG_SIZE)
         )
         pig_itp.invoke()
         preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
@@ -144,11 +139,10 @@ while True:
 
         pid = (x1,y1,x2,y2)
 
-        # ---- BEHAVIOR ----
         if frame_id % SKIP_BEH == 0:
             beh_itp.set_tensor(
                 beh_in[0]['index'],
-                preprocess(roi, BEH_SIZE)
+                preprocess(roi.copy(), BEH_SIZE)
             )
             beh_itp.invoke()
             out = beh_itp.get_tensor(beh_out[0]['index'])[0].T
@@ -157,11 +151,10 @@ while True:
 
         label = last_behavior.get(pid, "…")
 
-        # ---- SKIN (ROI ONLY) ----
         if frame_id % SKIP_SKIN == 0:
             skin_itp.set_tensor(
                 skin_in[0]['index'],
-                preprocess(roi, SKIN_SIZE)
+                preprocess(roi.copy(), SKIN_SIZE)
             )
             skin_itp.invoke()
             outs = skin_itp.get_tensor(skin_out[0]['index'])[0].T
@@ -182,40 +175,37 @@ while True:
 
                 skin_memory.append([(bx1,by1,bx2,by2), conf, cid, SKIN_HOLD_FRAMES])
 
-        # ---- DRAW PIG ----
-        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
-        cv2.putText(frame,
+        cv2.rectangle(frame_bgr,(x1,y1),(x2,y2),(0,255,0),2)
+        cv2.putText(frame_bgr,
             f"PIG {pconf:.2f} | {label}",
             (x1, max(0,y1-6)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
 
-    # -------- DRAW & UPDATE SKIN MEMORY --------
+    # -------- DRAW SKIN MEMORY --------
     updated = []
     for box, conf, cid, ttl in skin_memory:
         if ttl <= 0:
             continue
         x1,y1,x2,y2 = box
-        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,0,255),2)
-        cv2.putText(frame,
+        cv2.rectangle(frame_bgr,(x1,y1),(x2,y2),(0,0,255),2)
+        cv2.putText(frame_bgr,
             f"{SKIN_NAMES[cid]} {conf:.2f}",
             (x1,y1-4),
             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,255), 1)
         updated.append([box, conf, cid, ttl-1])
     skin_memory = updated
 
-    # -------- SMOOTH FPS --------
+    # -------- FPS --------
     now = time.time()
-    dt = now - fps_time
+    fps_buffer.append(1.0 / max(now - fps_time, 1e-6))
     fps_time = now
-    fps_buffer.append(1.0 / max(dt, 1e-6))
     if len(fps_buffer) > FPS_WINDOW:
         fps_buffer.pop(0)
-    avg_fps = sum(fps_buffer) / len(fps_buffer)
 
-    cv2.putText(frame, f"FPS: {avg_fps:.2f}", (10,30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+    cv2.putText(frame_bgr, f"FPS: {sum(fps_buffer)/len(fps_buffer):.2f}",
+                (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
 
-    cv2.imshow("ASF – PI FINAL PIPELINE", frame)
+    cv2.imshow("ASF – PI FINAL PIPELINE", frame_bgr)
     if cv2.waitKey(1) == 27:
         break
 
