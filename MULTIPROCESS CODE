@@ -78,13 +78,14 @@ pig_in, pig_out = pig_itp.get_input_details(), pig_itp.get_output_details()
 beh_in, beh_out = beh_itp.get_input_details(), beh_itp.get_output_details()
 skin_in, skin_out = skin_itp.get_input_details(), skin_itp.get_output_details()
 
-# ================= CAMERA =================
+# ================= CAMERA (FIXED) =================
 picam2 = Picamera2()
-config = picam2.create_preview_configuration(
+config = picam2.create_video_configuration(
     main={"format": "RGB888", "size": (640, 480)}
 )
 picam2.configure(config)
 picam2.start()
+time.sleep(0.5)  # 🔑 camera warm-up
 
 frame_id = 0
 fps_time = time.time()
@@ -97,8 +98,8 @@ skin_memory = []
 
 # ================= MAIN LOOP =================
 while True:
-    frame = picam2.capture_array()          # RGB frame
-    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # for display
+    frame = picam2.capture_array("main")  # 🔑 IMPORTANT
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
     frame_id += 1
     H, W, _ = frame.shape
