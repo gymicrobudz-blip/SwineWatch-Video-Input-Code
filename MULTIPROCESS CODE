@@ -5,8 +5,8 @@ from tflite_runtime.interpreter import Interpreter
 from picamera2 import Picamera2
 
 # ================= CONFIG =================
-PIG_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/PigvsNonPig.320.v3_v8s.tflite"
-BEHAVIOR_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/Behavior.320.v8_v8s.tflite"
+PIG_MODEL = "/home/asfrotect/Downloads/PigvsNonPig.320.v3_v8s.tflite"
+BEHAVIOR_MODEL = "/home/asfrotect/Downloads/Behavior.320.v9_v8s.tflite"
 SKIN_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/ASFskin_NoPartsv3_v8s.tflite"
 
 PIG_SIZE = 320
