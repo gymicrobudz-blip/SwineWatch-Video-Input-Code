@@ -9,10 +9,10 @@ from picamera2 import Picamera2
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
 
-# ================= TIME INTERVAL CONFIG =================
+# ================= INTERVAL CONFIG =================
 INTERVAL_MODE = "minute"   # "minute" or "hour"
-INTERVAL_VALUE = 30        # e.g. 30 minutes or 1 hour
-SAVE_ROOT = "/home/asfrotect/detections"
+INTERVAL_VALUE = 30        # every 30 minutes
+SAVE_ROOT = "/home/asfrotect/Desktop/detections"
 
 # ================= CONFIG =================
 INPUT_SIZE = 416
@@ -96,6 +96,13 @@ def interval_seconds(mode, value):
         return value * 3600
     raise ValueError("Invalid INTERVAL_MODE")
 
+def print_countdown(last_time, interval_sec):
+    remaining = int(interval_sec - (time.time() - last_time))
+    if remaining < 0:
+        remaining = 0
+    m, s = divmod(remaining, 60)
+    print(f"\rNext capture in: {m:02d}:{s:02d}", end="")
+
 # ================= MODELS =================
 pig_itp = load_model(PIG_MODEL)
 beh_itp = load_model(BEHAVIOR_MODEL)
@@ -114,13 +121,28 @@ picam2.configure(
 )
 picam2.start()
 
+# ================= STARTUP TEST SAVE =================
+os.makedirs(SAVE_ROOT, exist_ok=True)
+
+startup_frame = picam2.capture_array()
+startup_frame = cv2.flip(startup_frame, 0)
+
+date = time.strftime("%Y-%m-%d")
+tstamp = time.strftime("%H-%M-%S")
+startup_dir = os.path.join(SAVE_ROOT, date)
+os.makedirs(startup_dir, exist_ok=True)
+
+startup_path = os.path.join(startup_dir, f"STARTUP_TEST_{tstamp}.jpg")
+cv2.imwrite(startup_path, startup_frame)
+print(f"[STARTUP TEST SAVED] {startup_path}")
+
 # ================= STATE =================
 frame_id = 0
 fps_t = time.time()
 pig_behaviors = {}
 
 INTERVAL_SEC = interval_seconds(INTERVAL_MODE, INTERVAL_VALUE)
-last_detection_time = 0
+last_detection_time = time.time()  # waits full interval after startup test
 
 # ================= MAIN LOOP =================
 while True:
@@ -233,9 +255,11 @@ while True:
 
         save_path = os.path.join(save_dir, f"{tstamp}.jpg")
         cv2.imwrite(save_path, frame)
+        print(f"\n[SAVED] {save_path}")
 
-        print(f"[SAVED] {save_path}")
         last_detection_time = now
+
+    print_countdown(last_detection_time, INTERVAL_SEC)
 
     # ---- FPS ----
     fps = 1 / (time.time() - fps_t + 1e-6)
