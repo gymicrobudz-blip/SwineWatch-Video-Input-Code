@@ -83,15 +83,6 @@ def nms_pig(dets, thr):
         dets = [d for d in dets if compute_iou(best[0], d[0]) < thr]
     return out
 
-def nms_skin(dets, thr):
-    dets = sorted(dets, key=lambda x: x[1], reverse=True)
-    out = []
-    while dets:
-        best = dets.pop(0)
-        out.append(best)
-        dets = [d for d in dets if compute_iou(best[0], d[0]) < thr or best[2] != d[2]]
-    return out
-
 def overlaps_any(box, boxes, thr=0.25):
     return any(compute_iou(box, b) > thr for b in boxes)
 
@@ -106,13 +97,6 @@ def load_model(path):
 
 def interval_seconds(mode, value):
     return value * 60 if mode == "minute" else value * 3600
-
-def print_countdown(last_time, interval_sec):
-    remaining = int(interval_sec - (time.time() - last_time))
-    if remaining < 0:
-        remaining = 0
-    m, s = divmod(remaining, 60)
-    print(f"\rNext capture in: {m:02d}:{s:02d}", end="")
 
 def draw_thermal_legend(img, tmin=20.0, tmax=40.0):
     h, w, _ = img.shape
@@ -132,7 +116,6 @@ skin_itp = load_model(SKIN_MODEL)
 
 pig_in, pig_out = pig_itp.get_input_details(), pig_itp.get_output_details()
 beh_in, beh_out = beh_itp.get_input_details(), beh_itp.get_output_details()
-skin_in, skin_out = skin_itp.get_input_details(), skin_itp.get_output_details()
 
 # ================= CAMERA =================
 picam2 = Picamera2()
@@ -172,9 +155,6 @@ frame_id = 0
 fps_t = time.time()
 pig_behaviors = {}
 
-INTERVAL_SEC = interval_seconds(INTERVAL_MODE, INTERVAL_VALUE)
-last_detection_time = time.time()
-
 # ================= MAIN LOOP =================
 while True:
     frame = picam2.capture_array()
@@ -182,7 +162,7 @@ while True:
     frame_id += 1
     H, W, _ = frame.shape
 
-    # ===== FIX: THERMAL READ =====
+    # ---- THERMAL READ ----
     if THERMAL_AVAILABLE and (time.time() - last_thermal_time) >= THERMAL_READ_INTERVAL:
         try:
             cached_thermal_rgb = thermal_to_rgb(read_thermal())
@@ -198,7 +178,7 @@ while True:
     pig_itp.invoke()
     preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
 
-    pigs, humans = [], []
+    pigs = []
     for d in preds:
         x, y, bw, bh = d[:4]
         scores = d[4:]
@@ -214,8 +194,6 @@ while True:
 
         if cid == PIG_CLASS_ID:
             pigs.append(((x1, y1, x2, y2), conf))
-        elif cid == HUMAN_CLASS_ID:
-            humans.append((x1, y1, x2, y2))
 
     pigs = nms_pig(pigs, 0.4)
 
@@ -237,7 +215,7 @@ while True:
         cv2.putText(frame, f"PIG {conf:.2f} | {pig_behaviors[pid][0]}",
                     (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
 
-    # ---- PREVIEW ----
+    # ---- BUILD PREVIEW ----
     if cached_thermal_rgb is not None:
         thermal_preview = cv2.resize(cached_thermal_rgb, (W, H))
         thermal_preview = cv2.flip(thermal_preview, 0)
@@ -245,6 +223,32 @@ while True:
         preview = cv2.hconcat([frame, thermal_preview])
     else:
         preview = frame.copy()
+
+    # ---- FPS COUNTER (MATCHES WORKING CODE) ----
+    now_fps = time.time()
+    PI_CAM_FPS = 1.0 / max(1e-6, now_fps - fps_t)
+    fps_t = now_fps
+
+    cv2.putText(
+        preview,
+        f"Pi FPS: {PI_CAM_FPS:.1f}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 255),
+        2
+    )
+
+    if THERMAL_AVAILABLE:
+        cv2.putText(
+            preview,
+            f"Avg Temp: {THERMAL_AVG_TEMP:.1f} C",
+            (10, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 180, 255),
+            2
+        )
 
     cv2.imshow("ASF PI - Idle Mode", preview)
 
