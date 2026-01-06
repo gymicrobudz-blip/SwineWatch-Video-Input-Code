@@ -178,6 +178,23 @@ pig_behaviors = {}
 INTERVAL_SEC = interval_seconds(INTERVAL_MODE, INTERVAL_VALUE)
 last_detection_time = time.time()
 
+os.makedirs(SAVE_ROOT, exist_ok=True)
+
+# ================= STARTUP TEST SAVE =================
+startup_frame = picam2.capture_array()
+startup_frame = cv2.flip(startup_frame, 0)
+
+date = time.strftime("%Y-%m-%d")
+tstamp = time.strftime("%H-%M-%S")
+
+startup_dir = os.path.join(SAVE_ROOT, date)
+os.makedirs(startup_dir, exist_ok=True)
+
+startup_path = os.path.join(startup_dir, f"STARTUP_TEST_{tstamp}.jpg")
+cv2.imwrite(startup_path, startup_frame)
+
+print(f"[STARTUP TEST SAVED] {startup_path}")
+
 # ================= MAIN LOOP =================
 while True:
     frame = cv2.flip(picam2.capture_array(), 0)
@@ -292,6 +309,35 @@ while True:
 
     if cv2.waitKey(1)==27:
         break
+
+    # ================= SAVE RGB + THERMAL (INTERVAL) =================
+    now = time.time()
+    if (now - last_detection_time) >= INTERVAL_SEC:
+
+        # ---- THERMAL FRAME FOR SAVE ----
+        if cached_thermal_rgb is not None:
+            thermal_rgb = cv2.resize(cached_thermal_rgb, (detect_frame.shape[1], detect_frame.shape[0]))
+            thermal_rgb = cv2.flip(thermal_rgb, 0)
+            draw_thermal_legend(thermal_rgb)
+        else:
+            thermal_rgb = np.zeros_like(detect_frame)
+
+        # ---- COMBINE RGB + THERMAL ----
+        combined = cv2.hconcat([detect_frame, thermal_rgb])
+
+        # ---- SAVE PATH ----
+        date = time.strftime("%Y-%m-%d")
+        tstamp = time.strftime("%H-%M-%S")
+
+        save_dir = os.path.join(SAVE_ROOT, date)
+        os.makedirs(save_dir, exist_ok=True)
+
+        save_path = os.path.join(save_dir, f"{tstamp}.jpg")
+        cv2.imwrite(save_path, combined)
+
+        print(f"\n[SAVED RGB + THERMAL] {save_path}")
+
+        last_detection_time = now
 
 picam2.stop()
 cv2.destroyAllWindows()
