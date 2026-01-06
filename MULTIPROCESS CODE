@@ -1,32 +1,36 @@
 import cv2
 import numpy as np
 import time
+import os
 from tflite_runtime.interpreter import Interpreter
 from picamera2 import Picamera2
 
+# ================= PERFORMANCE =================
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
+# ================= TIME INTERVAL CONFIG =================
+INTERVAL_MODE = "minute"   # "minute" or "hour"
+INTERVAL_VALUE = 30        # e.g. 30 minutes or 1 hour
+SAVE_ROOT = "/home/asfrotect/detections"
+
 # ================= CONFIG =================
-PIG_MODEL = "/home/asfrotect/Downloads/PigvsNonPig.320.v3_v8s.tflite"
-BEHAVIOR_MODEL = "/home/asfrotect/Downloads/Behavior.320.v9_v8s.tflite"
+INPUT_SIZE = 416
+SMALL_W = 320
+
+PIG_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/PigvsNONPig-v2_float16.tflite"
+BEHAVIOR_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/bestv8_behavior-2_float16.tflite"
 SKIN_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/ASFskin_NoPartsv3_v8s.tflite"
 
-PIG_SIZE = 320
-BEH_SIZE = 320
-SKIN_SIZE = 416
-
-PIG_CONF = 0.45
-BEH_CONF = 0.40
-SKIN_CONF = 0.35
-
-PIG_IOU = 0.40
-SKIN_IOU = 0.25
-
-SKIP_PIG = 3
-SKIP_BEH = 6
-SKIP_SKIN = 8
-
-SKIN_HOLD_FRAMES = 7
-
 PIG_CLASS_ID = 7
+HUMAN_CLASS_ID = 0
+
+PIG_CONF = 0.50
+LESION_CONF = 0.1
+REDNESS_CONF = 0.1
+
+BEHAVIOR_INTERVAL = 12
+ROI_PAD = 0.15
 
 # ================= LABELS =================
 BEHAVIOR_NAMES = {
@@ -42,10 +46,10 @@ SKIN_NAMES = {
 }
 
 # ================= HELPERS =================
-def preprocess(img, size):
-    img = cv2.resize(img, (size, size))
-    img = img.astype(np.float32) / 255.0
-    return img[np.newaxis, ...]
+def preprocess(img):
+    img = cv2.resize(img, (INPUT_SIZE, INPUT_SIZE))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return (img.astype(np.float32) / 255.0)[None]
 
 def compute_iou(a, b):
     xA, yA = max(a[0], b[0]), max(a[1], b[1])
@@ -55,21 +59,44 @@ def compute_iou(a, b):
     areaB = max(0, b[2]-b[0]) * max(0, b[3]-b[1])
     return inter / (areaA + areaB - inter + 1e-6)
 
-def nms(dets, thresh):
+def nms_pig(dets, thr):
     dets = sorted(dets, key=lambda x: x[1], reverse=True)
-    keep = []
+    out = []
     while dets:
         best = dets.pop(0)
-        keep.append(best)
-        dets = [d for d in dets if compute_iou(best[0], d[0]) < thresh]
-    return keep
+        out.append(best)
+        dets = [d for d in dets if compute_iou(best[0], d[0]) < thr]
+    return out
+
+def nms_skin(dets, thr):
+    dets = sorted(dets, key=lambda x: x[1], reverse=True)
+    out = []
+    while dets:
+        best = dets.pop(0)
+        out.append(best)
+        dets = [d for d in dets if compute_iou(best[0], d[0]) < thr or best[2] != d[2]]
+    return out
+
+def overlaps_any(box, boxes, thr=0.25):
+    return any(compute_iou(box, b) > thr for b in boxes)
+
+def pig_id(box):
+    x1, y1, x2, y2 = box
+    return (x1//30, y1//30, x2//30, y2//30)
 
 def load_model(path):
     itp = Interpreter(model_path=path, num_threads=4)
     itp.allocate_tensors()
     return itp
 
-# ================= LOAD MODELS =================
+def interval_seconds(mode, value):
+    if mode == "minute":
+        return value * 60
+    if mode == "hour":
+        return value * 3600
+    raise ValueError("Invalid INTERVAL_MODE")
+
+# ================= MODELS =================
 pig_itp = load_model(PIG_MODEL)
 beh_itp = load_model(BEHAVIOR_MODEL)
 skin_itp = load_model(SKIN_MODEL)
@@ -78,135 +105,145 @@ pig_in, pig_out = pig_itp.get_input_details(), pig_itp.get_output_details()
 beh_in, beh_out = beh_itp.get_input_details(), beh_itp.get_output_details()
 skin_in, skin_out = skin_itp.get_input_details(), skin_itp.get_output_details()
 
-# ================= CAMERA (FIXED) =================
+# ================= CAMERA =================
 picam2 = Picamera2()
-config = picam2.create_video_configuration(
-    main={"format": "RGB888", "size": (640, 480)}
+picam2.configure(
+    picam2.create_preview_configuration(
+        main={"format": "RGB888", "size": (640, 480)}
+    )
 )
-picam2.configure(config)
 picam2.start()
-time.sleep(0.5)  # 🔑 camera warm-up
 
+# ================= STATE =================
 frame_id = 0
-fps_time = time.time()
-fps_buffer = []
-FPS_WINDOW = 20
+fps_t = time.time()
+pig_behaviors = {}
 
-last_pigs = []
-last_behavior = {}
-skin_memory = []
+INTERVAL_SEC = interval_seconds(INTERVAL_MODE, INTERVAL_VALUE)
+last_detection_time = 0
 
 # ================= MAIN LOOP =================
 while True:
-    frame = picam2.capture_array("main")  # 🔑 IMPORTANT
-    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
+    frame = picam2.capture_array()
+    frame = cv2.flip(frame, 0)
     frame_id += 1
     H, W, _ = frame.shape
 
-    # -------- PIG DETECTION --------
-    if frame_id % SKIP_PIG == 0:
-        pig_itp.set_tensor(
-            pig_in[0]['index'],
-            preprocess(frame.copy(), PIG_SIZE)
-        )
-        pig_itp.invoke()
-        preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
+    # ---- PIG DETECTION ----
+    small = cv2.resize(frame, (SMALL_W, int(H * SMALL_W / W)))
+    sx, sy = W / small.shape[1], H / small.shape[0]
 
-        pigs = []
-        for d in preds:
-            x, y, bw, bh = d[:4]
-            scores = d[4:]
-            cid = int(np.argmax(scores))
-            conf = float(scores[cid])
+    pig_itp.set_tensor(pig_in[0]['index'], preprocess(small))
+    pig_itp.invoke()
+    preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
 
-            if cid != PIG_CLASS_ID or conf < PIG_CONF:
-                continue
+    pigs, humans = [], []
 
-            x1 = int((x - bw/2) * W)
-            y1 = int((y - bh/2) * H)
-            x2 = int((x + bw/2) * W)
-            y2 = int((y + bh/2) * H)
+    for d in preds:
+        x, y, bw, bh = d[:4]
+        scores = d[4:]
+        cid = int(np.argmax(scores))
+        conf = float(scores[cid])
+        if conf < PIG_CONF:
+            continue
 
-            pigs.append(((x1,y1,x2,y2), conf))
+        x1 = int((x - bw/2) * small.shape[1] * sx)
+        y1 = int((y - bh/2) * small.shape[0] * sy)
+        x2 = int((x + bw/2) * small.shape[1] * sx)
+        y2 = int((y + bh/2) * small.shape[0] * sy)
 
-        last_pigs = nms(pigs, PIG_IOU)
+        if cid == PIG_CLASS_ID:
+            pigs.append(((x1, y1, x2, y2), conf))
+        elif cid == HUMAN_CLASS_ID:
+            humans.append((x1, y1, x2, y2))
 
-    # -------- PER PIG --------
-    for (x1,y1,x2,y2), pconf in last_pigs:
-        roi = frame[max(0,y1):min(H,y2), max(0,x1):min(W,x2)]
+    pigs = nms_pig(pigs, 0.4)
+
+    # ---- BEHAVIOR ----
+    for (x1, y1, x2, y2), conf in pigs:
+        pid = pig_id((x1, y1, x2, y2))
+        roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
             continue
 
-        pid = (x1,y1,x2,y2)
-
-        if frame_id % SKIP_BEH == 0:
-            beh_itp.set_tensor(
-                beh_in[0]['index'],
-                preprocess(roi.copy(), BEH_SIZE)
-            )
+        if pid not in pig_behaviors or frame_id - pig_behaviors[pid][1] >= BEHAVIOR_INTERVAL:
+            beh_itp.set_tensor(beh_in[0]['index'], preprocess(roi))
             beh_itp.invoke()
-            out = beh_itp.get_tensor(beh_out[0]['index'])[0].T
-            best = max(out, key=lambda d: max(d[4:]))
-            last_behavior[pid] = BEHAVIOR_NAMES[int(np.argmax(best[4:]))]
+            o = beh_itp.get_tensor(beh_out[0]['index'])[0].T
+            behavior = BEHAVIOR_NAMES[int(np.argmax(max(o, key=lambda d: max(d[4:]))[4:]))]
+            pig_behaviors[pid] = (behavior, frame_id)
 
-        label = last_behavior.get(pid, "…")
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+        cv2.putText(frame, f"PIG {conf:.2f} | {pig_behaviors[pid][0]}",
+                    (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
 
-        if frame_id % SKIP_SKIN == 0:
-            skin_itp.set_tensor(
-                skin_in[0]['index'],
-                preprocess(roi.copy(), SKIN_SIZE)
-            )
+    # ---- INTERVAL SKIN DETECTION + SAVE ----
+    now = time.time()
+    if pigs and (now - last_detection_time) >= INTERVAL_SEC:
+        for (x1, y1, x2, y2), _ in pigs:
+            pw = int((x2 - x1) * ROI_PAD)
+            ph = int((y2 - y1) * ROI_PAD)
+
+            px1 = max(0, x1 - pw)
+            py1 = max(0, y1 - ph)
+            px2 = min(W, x2 + pw)
+            py2 = min(H, y2 + ph)
+
+            roi = frame[py1:py2, px1:px2]
+            if roi.size == 0:
+                continue
+
+            skin_itp.set_tensor(skin_in[0]['index'], preprocess(roi))
             skin_itp.invoke()
             outs = skin_itp.get_tensor(skin_out[0]['index'])[0].T
 
+            dets = []
             for d in outs:
-                sx, sy, sw, sh = d[:4]
+                x, y, bw, bh = d[:4]
                 scores = d[4:]
                 cid = int(np.argmax(scores))
                 conf = float(scores[cid])
 
-                if cid not in SKIN_NAMES or conf < SKIN_CONF:
+                if cid == 1 and conf < LESION_CONF:
+                    continue
+                if cid == 2 and conf < REDNESS_CONF:
+                    continue
+                if cid not in SKIN_NAMES:
                     continue
 
-                bx1 = int(x1 + (sx - sw/2) * (x2-x1))
-                by1 = int(y1 + (sy - sh/2) * (y2-y1))
-                bx2 = int(x1 + (sx + sw/2) * (x2-x1))
-                by2 = int(y1 + (sy + sh/2) * (y2-y1))
+                rx1 = int(px1 + (x - bw/2) * (px2 - px1))
+                ry1 = int(py1 + (y - bh/2) * (py2 - py1))
+                rx2 = int(px1 + (x + bw/2) * (px2 - px1))
+                ry2 = int(py1 + (y + bh/2) * (py2 - py1))
 
-                skin_memory.append([(bx1,by1,bx2,by2), conf, cid, SKIN_HOLD_FRAMES])
+                if overlaps_any((rx1, ry1, rx2, ry2), humans):
+                    continue
 
-        cv2.rectangle(frame_bgr,(x1,y1),(x2,y2),(0,255,0),2)
-        cv2.putText(frame_bgr,
-            f"PIG {pconf:.2f} | {label}",
-            (x1, max(0,y1-6)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
+                dets.append(((rx1, ry1, rx2, ry2), conf, cid))
 
-    # -------- DRAW SKIN MEMORY --------
-    updated = []
-    for box, conf, cid, ttl in skin_memory:
-        if ttl <= 0:
-            continue
-        x1,y1,x2,y2 = box
-        cv2.rectangle(frame_bgr,(x1,y1),(x2,y2),(0,0,255),2)
-        cv2.putText(frame_bgr,
-            f"{SKIN_NAMES[cid]} {conf:.2f}",
-            (x1,y1-4),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,255), 1)
-        updated.append([box, conf, cid, ttl-1])
-    skin_memory = updated
+            for (bx1, by1, bx2, by2), conf, cid in nms_skin(dets, 0.45):
+                cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0,0,255), 2)
+                cv2.putText(frame, f"{SKIN_NAMES[cid]} {conf:.2f}",
+                            (bx1, by1-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,255), 1)
 
-    # -------- FPS --------
-    now = time.time()
-    fps_buffer.append(1.0 / max(now - fps_time, 1e-6))
-    fps_time = now
-    if len(fps_buffer) > FPS_WINDOW:
-        fps_buffer.pop(0)
+        date = time.strftime("%Y-%m-%d")
+        tstamp = time.strftime("%H-%M-%S")
+        save_dir = os.path.join(SAVE_ROOT, date)
+        os.makedirs(save_dir, exist_ok=True)
 
-    cv2.putText(frame_bgr, f"FPS: {sum(fps_buffer)/len(fps_buffer):.2f}",
-                (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+        save_path = os.path.join(save_dir, f"{tstamp}.jpg")
+        cv2.imwrite(save_path, frame)
 
-    cv2.imshow("ASF – PI FINAL PIPELINE", frame_bgr)
+        print(f"[SAVED] {save_path}")
+        last_detection_time = now
+
+    # ---- FPS ----
+    fps = 1 / (time.time() - fps_t + 1e-6)
+    fps_t = time.time()
+    cv2.putText(frame, f"FPS: {fps:.1f}", (10,30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+
+    cv2.imshow("ASF PI - Interval Mode", frame)
     if cv2.waitKey(1) == 27:
         break
 
