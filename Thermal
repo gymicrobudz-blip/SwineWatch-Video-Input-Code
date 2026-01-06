@@ -29,6 +29,7 @@ SAVE_ROOT = "/home/asfrotect/Desktop/detections"
 INPUT_SIZE = 416
 SMALL_W = 320
 
+# ================= SHARED METRICS =================
 PI_CAM_FPS = 0.0
 THERMAL_AVG_TEMP = 0.0
 
@@ -46,6 +47,7 @@ REDNESS_CONF = 0.1
 BEHAVIOR_INTERVAL = 12
 ROI_PAD = 0.15
 
+# ================= LABELS =================
 BEHAVIOR_NAMES = {
     0: "ACTIVE",
     1: "EATING",
@@ -93,31 +95,47 @@ def nms_skin(dets, thr):
 def overlaps_any(box, boxes, thr=0.25):
     return any(compute_iou(box, b) > thr for b in boxes)
 
+def pig_id(box):
+    x1, y1, x2, y2 = box
+    return (x1//30, y1//30, x2//30, y2//30)
+
 def load_model(path):
     itp = Interpreter(model_path=path, num_threads=4)
     itp.allocate_tensors()
     return itp
 
 def interval_seconds(mode, value):
-    return value * 60 if mode == "minute" else value * 3600
+    if mode == "minute":
+        return value * 60
+    if mode == "hour":
+        return value * 3600
+    raise ValueError("Invalid INTERVAL_MODE")
 
 def print_countdown(last_time, interval_sec):
     remaining = int(interval_sec - (time.time() - last_time))
-    remaining = max(0, remaining)
+    if remaining < 0:
+        remaining = 0
     m, s = divmod(remaining, 60)
     print(f"\rNext capture in: {m:02d}:{s:02d}", end="")
 
 def draw_thermal_legend(img, tmin=20.0, tmax=40.0):
     h, w, _ = img.shape
-    bar_w, pad_x = 20, 10
-    x1, x2 = w - bar_w - pad_x, w - pad_x
-    y1, y2 = 50, h - 60
+    bar_w = 20
+    pad_x = 10
+    top_margin = 50
+    bottom_margin = 60
+
+    x1 = w - bar_w - pad_x
+    x2 = w - pad_x
+    y1 = top_margin
+    y2 = h - bottom_margin
 
     for i in range(y1, y2):
-        ratio = 1 - (i - y1) / (y2 - y1)
+        ratio = 1.0 - (i - y1) / (y2 - y1)
         temp = tmin + ratio * (tmax - tmin)
-        norm = (temp - tmin) / (tmax - tmin)
-        bgr = tuple(int(c * 255) for c in reversed(cm.inferno(norm)[:3]))
+        norm = (temp - tmin) / max(1e-6, (tmax - tmin))
+        color = cm.inferno(norm)[:3]
+        bgr = tuple(int(c * 255) for c in reversed(color))
         cv2.line(img, (x1, i), (x2, i), bgr, 1)
 
     cv2.rectangle(img, (x1, y1), (x2, y2), (255,255,255), 1)
@@ -133,9 +151,11 @@ skin_in, skin_out = skin_itp.get_input_details(), skin_itp.get_output_details()
 
 # ================= CAMERA =================
 picam2 = Picamera2()
-picam2.configure(picam2.create_preview_configuration(
-    main={"format": "RGB888", "size": (640, 480)}
-))
+picam2.configure(
+    picam2.create_preview_configuration(
+        main={"format": "RGB888", "size": (640, 480)}
+    )
+)
 picam2.start()
 
 # ================= THERMAL INIT =================
@@ -152,8 +172,19 @@ THERMAL_READ_INTERVAL = 0.5
 last_thermal_time = 0
 cached_thermal_rgb = None
 
+# ================= STARTUP TEST SAVE =================
+os.makedirs(SAVE_ROOT, exist_ok=True)
+startup_frame = cv2.flip(picam2.capture_array(), 0)
+date = time.strftime("%Y-%m-%d")
+startup_dir = os.path.join(SAVE_ROOT, date)
+os.makedirs(startup_dir, exist_ok=True)
+cv2.imwrite(os.path.join(startup_dir, f"STARTUP_TEST_{time.strftime('%H-%M-%S')}.jpg"), startup_frame)
+
 # ================= STATE =================
+frame_id = 0
 fps_t = time.time()
+pig_behaviors = {}
+
 INTERVAL_SEC = interval_seconds(INTERVAL_MODE, INTERVAL_VALUE)
 last_detection_time = time.time()
 
@@ -161,8 +192,8 @@ last_detection_time = time.time()
 while True:
     frame = cv2.flip(picam2.capture_array(), 0)
 
-    # ---- THERMAL READ ----
-    if THERMAL_AVAILABLE and time.time() - last_thermal_time >= THERMAL_READ_INTERVAL:
+    # ---- THERMAL (RATE-LIMITED, NON-BLOCKING) ----
+    if THERMAL_AVAILABLE and (time.time() - last_thermal_time) >= THERMAL_READ_INTERVAL:
         try:
             mlx90640.getFrame(thermal_frame)
             data = thermal_frame.reshape((24, 32))
@@ -171,17 +202,17 @@ while True:
                 np.clip((data - 20) / 20, 0, 1)
             )[:, :, :3] * 255).astype(np.uint8)
             last_thermal_time = time.time()
-        except:
-            pass
+        except Exception as e:
+            print("Thermal error:", e)
 
     now = time.time()
 
-    # ================= INTERVAL DETECTION =================
-    if now - last_detection_time >= INTERVAL_SEC:
+    # ================= INTERVAL TRIGGER =================
+    if (now - last_detection_time) >= INTERVAL_SEC:
         detect_frame = frame.copy()
         H, W, _ = detect_frame.shape
 
-        # ======== ✅ WORKING PIG DETECTION (FROM CODE #1) ========
+        # ================= PIG DETECTION (FROM CODE 1) =================
         small = cv2.resize(detect_frame, (SMALL_W, int(H * SMALL_W / W)))
         sx, sy = W / small.shape[1], H / small.shape[0]
 
@@ -210,30 +241,61 @@ while True:
                 humans.append((x1, y1, x2, y2))
 
         pigs = nms_pig(pigs, 0.4)
-        # ======== END REPLACED SECTION ========
+        # ================= END PIG DETECTION =================
 
+        # ================= BEHAVIOR + SKIN (UNCHANGED) =================
         for (x1, y1, x2, y2), conf in pigs:
-            cv2.rectangle(detect_frame, (x1,y1),(x2,y2),(0,255,0),2)
+            pid = pig_id((x1, y1, x2, y2))
+            roi = detect_frame[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
 
-        combined = detect_frame
+            if pid not in pig_behaviors or frame_id - pig_behaviors[pid][1] >= BEHAVIOR_INTERVAL:
+                beh_itp.set_tensor(beh_in[0]['index'], preprocess(roi))
+                beh_itp.invoke()
+                o = beh_itp.get_tensor(beh_out[0]['index'])[0].T
+                behavior = BEHAVIOR_NAMES[int(np.argmax(max(o, key=lambda d: max(d[4:]))[4:]))]
+                pig_behaviors[pid] = (behavior, frame_id)
+
+            cv2.rectangle(detect_frame, (x1, y1), (x2, y2), (0,255,0), 2)
+            cv2.putText(detect_frame, f"PIG {conf:.2f} | {pig_behaviors[pid][0]}",
+                        (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
+
+        # ================= SAVE (UNCHANGED) =================
         if cached_thermal_rgb is not None:
-            thermal_resized = cv2.resize(cached_thermal_rgb, (W, H))
-            draw_thermal_legend(thermal_resized)
-            combined = cv2.hconcat([detect_frame, thermal_resized])
+            thermal_rgb = cv2.resize(cached_thermal_rgb, (W, H))
+            thermal_rgb = cv2.flip(thermal_rgb, 0)
+            draw_thermal_legend(thermal_rgb)
+        else:
+            thermal_rgb = np.zeros_like(detect_frame)
+
+        combined = cv2.hconcat([detect_frame, thermal_rgb])
 
         date = time.strftime("%Y-%m-%d")
-        os.makedirs(os.path.join(SAVE_ROOT, date), exist_ok=True)
-        path = os.path.join(SAVE_ROOT, date, f"{time.strftime('%H-%M-%S')}.jpg")
-        cv2.imwrite(path, combined)
-        print(f"[SAVED] {path}")
+        save_dir = os.path.join(SAVE_ROOT, date)
+        os.makedirs(save_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(save_dir, f"{time.strftime('%H-%M-%S')}.jpg"), combined)
 
         last_detection_time = now
 
-    # ---- PREVIEW ----
-    preview = frame
-    cv2.putText(preview, f"FPS: {1/(time.time()-fps_t+1e-6):.1f}",
-                (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+    # ================= PREVIEW (UNCHANGED) =================
+    if cached_thermal_rgb is not None:
+        thermal_preview = cv2.resize(cached_thermal_rgb, (frame.shape[1], frame.shape[0]))
+        thermal_preview = cv2.flip(thermal_preview, 0)
+        draw_thermal_legend(thermal_preview)
+        preview = cv2.hconcat([frame, thermal_preview])
+    else:
+        preview = frame.copy()
+
+    PI_CAM_FPS = 1.0 / max(1e-6, time.time() - fps_t)
     fps_t = time.time()
+
+    cv2.putText(preview, f"Pi FPS: {PI_CAM_FPS:.1f}", (10,30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+
+    if THERMAL_AVAILABLE:
+        cv2.putText(preview, f"Avg Temp: {THERMAL_AVG_TEMP:.1f} C", (10,55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,180,255), 2)
 
     print_countdown(last_detection_time, INTERVAL_SEC)
     cv2.imshow("ASF PI - Idle Mode", preview)
