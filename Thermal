@@ -35,17 +35,10 @@ THERMAL_AVG_TEMP = 0.0
 
 PIG_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/PigvsNONPig-v2_float16.tflite"
 BEHAVIOR_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/bestv8_behavior-2_float16.tflite"
-SKIN_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/ASFskin_NoPartsv3_v8s.tflite"
 
 PIG_CLASS_ID = 7
-HUMAN_CLASS_ID = 0
-
 PIG_CONF = 0.50
-LESION_CONF = 0.1
-REDNESS_CONF = 0.1
-
 BEHAVIOR_INTERVAL = 12
-ROI_PAD = 0.15
 
 # ================= LABELS =================
 BEHAVIOR_NAMES = {
@@ -53,11 +46,6 @@ BEHAVIOR_NAMES = {
     1: "EATING",
     2: "GROUP",
     3: "INACTIVE"
-}
-
-SKIN_NAMES = {
-    1: "ASF LESION",
-    2: "REDNESS"
 }
 
 # ================= HELPERS =================
@@ -83,9 +71,6 @@ def nms_pig(dets, thr):
         dets = [d for d in dets if compute_iou(best[0], d[0]) < thr]
     return out
 
-def overlaps_any(box, boxes, thr=0.25):
-    return any(compute_iou(box, b) > thr for b in boxes)
-
 def pig_id(box):
     x1, y1, x2, y2 = box
     return (x1//30, y1//30, x2//30, y2//30)
@@ -97,6 +82,13 @@ def load_model(path):
 
 def interval_seconds(mode, value):
     return value * 60 if mode == "minute" else value * 3600
+
+def print_countdown(last_time, interval_sec):
+    remaining = int(interval_sec - (time.time() - last_time))
+    if remaining < 0:
+        remaining = 0
+    m, s = divmod(remaining, 60)
+    print(f"\rNext capture in: {m:02d}:{s:02d}", end="")
 
 def draw_thermal_legend(img, tmin=20.0, tmax=40.0):
     h, w, _ = img.shape
@@ -112,16 +104,17 @@ def draw_thermal_legend(img, tmin=20.0, tmax=40.0):
 # ================= MODELS =================
 pig_itp = load_model(PIG_MODEL)
 beh_itp = load_model(BEHAVIOR_MODEL)
-skin_itp = load_model(SKIN_MODEL)
 
 pig_in, pig_out = pig_itp.get_input_details(), pig_itp.get_output_details()
 beh_in, beh_out = beh_itp.get_input_details(), beh_itp.get_output_details()
 
 # ================= CAMERA =================
 picam2 = Picamera2()
-picam2.configure(picam2.create_preview_configuration(
-    main={"format": "RGB888", "size": (640, 480)}
-))
+picam2.configure(
+    picam2.create_preview_configuration(
+        main={"format": "RGB888", "size": (640, 480)}
+    )
+)
 picam2.start()
 
 # ================= THERMAL INIT =================
@@ -155,6 +148,9 @@ frame_id = 0
 fps_t = time.time()
 pig_behaviors = {}
 
+INTERVAL_SEC = interval_seconds(INTERVAL_MODE, INTERVAL_VALUE)
+last_detection_time = time.time()
+
 # ================= MAIN LOOP =================
 while True:
     frame = picam2.capture_array()
@@ -170,7 +166,7 @@ while True:
         except Exception as e:
             print("Thermal error:", e)
 
-    # ---- PIG DETECTION (UNCHANGED) ----
+    # ---- PIG DETECTION (YOUR LOGIC) ----
     small = cv2.resize(frame, (SMALL_W, int(H * SMALL_W / W)))
     sx, sy = W / small.shape[1], H / small.shape[0]
 
@@ -197,7 +193,7 @@ while True:
 
     pigs = nms_pig(pigs, 0.4)
 
-    # ---- BEHAVIOR (UNCHANGED) ----
+    # ---- BEHAVIOR (YOUR LOGIC) ----
     for (x1, y1, x2, y2), conf in pigs:
         pid = pig_id((x1, y1, x2, y2))
         roi = frame[y1:y2, x1:x2]
@@ -224,31 +220,20 @@ while True:
     else:
         preview = frame.copy()
 
-    # ---- FPS COUNTER (MATCHES WORKING CODE) ----
+    # ---- FPS COUNTER ----
     now_fps = time.time()
     PI_CAM_FPS = 1.0 / max(1e-6, now_fps - fps_t)
     fps_t = now_fps
 
-    cv2.putText(
-        preview,
-        f"Pi FPS: {PI_CAM_FPS:.1f}",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 255),
-        2
-    )
+    cv2.putText(preview, f"Pi FPS: {PI_CAM_FPS:.1f}",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
 
     if THERMAL_AVAILABLE:
-        cv2.putText(
-            preview,
-            f"Avg Temp: {THERMAL_AVG_TEMP:.1f} C",
-            (10, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 180, 255),
-            2
-        )
+        cv2.putText(preview, f"Avg Temp: {THERMAL_AVG_TEMP:.1f} C",
+                    (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,180,255), 2)
+
+    # ---- COUNTDOWN TIMER (FROM WORKING CODE) ----
+    print_countdown(last_detection_time, INTERVAL_SEC)
 
     cv2.imshow("ASF PI - Idle Mode", preview)
 
