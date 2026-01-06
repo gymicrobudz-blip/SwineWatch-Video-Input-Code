@@ -1,6 +1,4 @@
-# ================= FULL CODE (MERGED PROPERLY) =================
-# nothing unrelated removed
-
+# python asf_Thermal.py
 import cv2
 import numpy as np
 import time
@@ -32,6 +30,7 @@ SAVE_ROOT = "/home/asfrotect/Desktop/detections"
 INPUT_SIZE = 416
 SMALL_W = 320
 
+# ================= SHARED METRICS =================
 PI_CAM_FPS = 0.0
 THERMAL_AVG_TEMP = 0.0
 
@@ -125,10 +124,21 @@ skin_in, skin_out = skin_itp.get_input_details(), skin_itp.get_output_details()
 
 # ================= CAMERA =================
 picam2 = Picamera2()
-picam2.configure(picam2.create_preview_configuration(
-    main={"format": "RGB888", "size": (640, 480)}
-))
+picam2.configure(
+    picam2.create_preview_configuration(
+        main={"format": "RGB888", "size": (640, 480)}
+    )
+)
 picam2.start()
+
+# ================= STARTUP TEST SAVE =================
+os.makedirs(SAVE_ROOT, exist_ok=True)
+startup = cv2.flip(picam2.capture_array(), 0)
+
+date = time.strftime("%Y-%m-%d")
+tstamp = time.strftime("%H-%M-%S")
+os.makedirs(os.path.join(SAVE_ROOT, date), exist_ok=True)
+cv2.imwrite(f"{SAVE_ROOT}/{date}/STARTUP_TEST_{tstamp}.jpg", startup)
 
 # ================= STATE =================
 frame_id = 0
@@ -141,113 +151,117 @@ last_detection_time = time.time()
 # ================= MAIN LOOP =================
 while True:
     frame = cv2.flip(picam2.capture_array(), 0)
-    frame_id += 1   # 🔧 FIXED (FROM CODE 1)
-
+    frame_id += 1
     H, W, _ = frame.shape
 
-    # ================= INTERVAL TRIGGER =================
+    # ---- PIG DETECTION (LIGHTWEIGHT) ----
+    small = cv2.resize(frame, (SMALL_W, int(H * SMALL_W / W)))
+    sx, sy = W / small.shape[1], H / small.shape[0]
+
+    pig_itp.set_tensor(pig_in[0]['index'], preprocess(small))
+    pig_itp.invoke()
+    preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
+
+    pigs, humans = [], []
+    for d in preds:
+        x, y, bw, bh = d[:4]
+        scores = d[4:]
+        cid = int(np.argmax(scores))
+        conf = float(scores[cid])
+        if conf < PIG_CONF:
+            continue
+
+        x1 = int((x - bw/2) * small.shape[1] * sx)
+        y1 = int((y - bh/2) * small.shape[0] * sy)
+        x2 = int((x + bw/2) * small.shape[1] * sx)
+        y2 = int((y + bh/2) * small.shape[0] * sy)
+
+        if cid == PIG_CLASS_ID:
+            pigs.append(((x1, y1, x2, y2), conf))
+        elif cid == HUMAN_CLASS_ID:
+            humans.append((x1, y1, x2, y2))
+
+    pigs = nms_pig(pigs, 0.4)
+
+    # ---- BEHAVIOR (CACHED) ----
+    for (x1, y1, x2, y2), conf in pigs:
+        pid = pig_id((x1, y1, x2, y2))
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            continue
+
+        if pid not in pig_behaviors or frame_id - pig_behaviors[pid][1] >= BEHAVIOR_INTERVAL:
+            beh_itp.set_tensor(beh_in[0]['index'], preprocess(roi))
+            beh_itp.invoke()
+            o = beh_itp.get_tensor(beh_out[0]['index'])[0].T
+            behavior = BEHAVIOR_NAMES[int(np.argmax(max(o, key=lambda d: max(d[4:]))[4:]))]
+            pig_behaviors[pid] = (behavior, frame_id)
+
+        cv2.rectangle(frame, (x1,y1),(x2,y2),(0,255,0),2)
+        cv2.putText(frame, f"PIG {conf:.2f} | {pig_behaviors[pid][0]}",
+                    (x1,y1-6), cv2.FONT_HERSHEY_SIMPLEX,0.45,(0,255,0),1)
+
+    # ---- INTERVAL SKIN + SAVE (ONLY IF PIGS EXIST) ----
     now = time.time()
-    if (now - last_detection_time) >= INTERVAL_SEC:
+    if pigs and (now - last_detection_time) >= INTERVAL_SEC:
+        save_frame = frame.copy()
 
-        # ===== PIG DETECTION (CODE 1) =====
-        small = cv2.resize(frame, (SMALL_W, int(H * SMALL_W / W)))
-        sx, sy = W / small.shape[1], H / small.shape[0]
+        for (x1,y1,x2,y2), _ in pigs:
+            pw, ph = int((x2-x1)*ROI_PAD), int((y2-y1)*ROI_PAD)
+            px1, py1 = max(0,x1-pw), max(0,y1-ph)
+            px2, py2 = min(W,x2+pw), min(H,y2+ph)
 
-        pig_itp.set_tensor(pig_in[0]['index'], preprocess(small))
-        pig_itp.invoke()
-        preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
-
-        pigs, humans = [], []
-
-        for d in preds:
-            x, y, bw, bh = d[:4]
-            scores = d[4:]
-            cid = int(np.argmax(scores))
-            conf = float(scores[cid])
-            if conf < PIG_CONF:
+            roi = save_frame[py1:py2, px1:px2]
+            if roi.size == 0:
                 continue
 
-            x1 = int((x - bw/2) * small.shape[1] * sx)
-            y1 = int((y - bh/2) * small.shape[0] * sy)
-            x2 = int((x + bw/2) * small.shape[1] * sx)
-            y2 = int((y + bh/2) * small.shape[0] * sy)
+            skin_itp.set_tensor(skin_in[0]['index'], preprocess(roi))
+            skin_itp.invoke()
+            outs = skin_itp.get_tensor(skin_out[0]['index'])[0].T
 
-            if cid == PIG_CLASS_ID:
-                pigs.append(((x1, y1, x2, y2), conf))
-            elif cid == HUMAN_CLASS_ID:
-                humans.append((x1, y1, x2, y2))
+            dets=[]
+            for d in outs:
+                x,y,bw,bh=d[:4]
+                scores=d[4:]
+                cid=int(np.argmax(scores))
+                conf=float(scores[cid])
 
-        pigs = nms_pig(pigs, 0.4)
+                if cid==1 and conf<LESION_CONF: continue
+                if cid==2 and conf<REDNESS_CONF: continue
+                if cid not in SKIN_NAMES: continue
 
-        # ===== BEHAVIOR + SKIN (CODE 1) =====
-        if pigs:
-            for (x1, y1, x2, y2), conf in pigs:
-                pid = pig_id((x1, y1, x2, y2))
-                roi = frame[y1:y2, x1:x2]
-                if roi.size == 0:
+                rx1=int(px1+(x-bw/2)*(px2-px1))
+                ry1=int(py1+(y-bh/2)*(py2-py1))
+                rx2=int(px1+(x+bw/2)*(px2-px1))
+                ry2=int(py1+(y+bh/2)*(py2-py1))
+
+                if overlaps_any((rx1,ry1,rx2,ry2), humans):
                     continue
 
-                if pid not in pig_behaviors or frame_id - pig_behaviors[pid][1] >= BEHAVIOR_INTERVAL:
-                    beh_itp.set_tensor(beh_in[0]['index'], preprocess(roi))
-                    beh_itp.invoke()
-                    o = beh_itp.get_tensor(beh_out[0]['index'])[0].T
-                    behavior = BEHAVIOR_NAMES[int(np.argmax(max(o, key=lambda d: max(d[4:]))[4:]))]
-                    pig_behaviors[pid] = (behavior, frame_id)
+                dets.append(((rx1,ry1,rx2,ry2),conf,cid))
 
-                cv2.rectangle(frame, (x1,y1),(x2,y2),(0,255,0),2)
-                cv2.putText(frame, f"PIG {conf:.2f} | {pig_behaviors[pid][0]}",
-                            (x1,y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1)
+            for (bx1,by1,bx2,by2),conf,cid in nms_skin(dets,0.45):
+                cv2.rectangle(save_frame,(bx1,by1),(bx2,by2),(0,0,255),2)
+                cv2.putText(save_frame,f"{SKIN_NAMES[cid]} {conf:.2f}",
+                            (bx1,by1-4),cv2.FONT_HERSHEY_SIMPLEX,0.4,(0,0,255),1)
 
-                # ---- SKIN ----
-                pw = int((x2 - x1) * ROI_PAD)
-                ph = int((y2 - y1) * ROI_PAD)
-
-                px1 = max(0, x1 - pw)
-                py1 = max(0, y1 - ph)
-                px2 = min(W, x2 + pw)
-                py2 = min(H, y2 + ph)
-
-                skin_roi = frame[py1:py2, px1:px2]
-                if skin_roi.size == 0:
-                    continue
-
-                skin_itp.set_tensor(skin_in[0]['index'], preprocess(skin_roi))
-                skin_itp.invoke()
-                outs = skin_itp.get_tensor(skin_out[0]['index'])[0].T
-
-                dets = []
-                for d in outs:
-                    x, y, bw, bh = d[:4]
-                    scores = d[4:]
-                    cid = int(np.argmax(scores))
-                    conf = float(scores[cid])
-
-                    if cid == 1 and conf < LESION_CONF:
-                        continue
-                    if cid == 2 and conf < REDNESS_CONF:
-                        continue
-                    if cid not in SKIN_NAMES:
-                        continue
-
-                    rx1 = int(px1 + (x - bw/2) * (px2 - px1))
-                    ry1 = int(py1 + (y - bh/2) * (py2 - py1))
-                    rx2 = int(px1 + (x + bw/2) * (px2 - px1))
-                    ry2 = int(py1 + (y + bh/2) * (py2 - py1))
-
-                    if overlaps_any((rx1, ry1, rx2, ry2), humans):
-                        continue
-
-                    dets.append(((rx1, ry1, rx2, ry2), conf, cid))
-
-                for (bx1, by1, bx2, by2), conf, cid in nms_skin(dets, 0.45):
-                    cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0,0,255), 2)
-                    cv2.putText(frame, f"{SKIN_NAMES[cid]} {conf:.2f}",
-                                (bx1, by1-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,255), 1)
+        date=time.strftime("%Y-%m-%d")
+        tstamp=time.strftime("%H-%M-%S")
+        os.makedirs(f"{SAVE_ROOT}/{date}",exist_ok=True)
+        cv2.imwrite(f"{SAVE_ROOT}/{date}/{tstamp}.jpg", save_frame)
+        print(f"\n[SAVED] {SAVE_ROOT}/{date}/{tstamp}.jpg")
 
         last_detection_time = now
 
+    print_countdown(last_detection_time, INTERVAL_SEC)
+
+    fps = 1.0 / max(1e-6, time.time() - fps_t)
+    fps_t = time.time()
+    cv2.putText(frame,f"FPS: {fps:.1f}",(10,30),
+                cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,255),2)
+
     cv2.imshow("ASF PI - Interval Mode", frame)
-    if cv2.waitKey(1) == 27:
+    if cv2.waitKey(1)==27:
         break
 
 picam2.stop()
