@@ -33,8 +33,8 @@ THERMAL_AVG_TEMP = 0.0
 
 # ================= LIVE INFERENCE SWITCHES =================
 LIVE_PIG_INFERENCE = True
-LIVE_BEHAVIOR_INFERENCE = True
-LIVE_SKIN_INFERENCE = True
+LIVE_BEHAVIOR_INFERENCE = False
+LIVE_SKIN_INFERENCE = False
 
 # ================= MODELS =================
 PIG_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/PigvsNONPig-v2_float16.tflite"
@@ -167,10 +167,14 @@ cached_thermal_rgb = None
 
 def read_thermal():
     global THERMAL_AVG_TEMP
-    mlx90640.getFrame(thermal_frame)
-    data = thermal_frame.reshape((24, 32))
-    THERMAL_AVG_TEMP = float(np.mean(data))
-    return data
+    try:
+        mlx90640.getFrame(thermal_frame)
+        data = thermal_frame.reshape((24, 32))
+        THERMAL_AVG_TEMP = float(np.mean(data))
+        return data
+    except RuntimeError as e:
+        print(f"[THERMAL WARNING] {e}")
+        return None
 
 def thermal_to_rgb(t):
     return (cm.inferno(np.clip((t-20)/20,0,1))[:,:,:3]*255).astype(np.uint8)
@@ -207,7 +211,9 @@ while True:
     H, W, _ = frame.shape
 
     if THERMAL_AVAILABLE and time.time() - last_thermal_time >= THERMAL_READ_INTERVAL:
-        cached_thermal_rgb = thermal_to_rgb(read_thermal())
+        tdata = read_thermal()
+        if tdata is not None:
+            cached_thermal_rgb = thermal_to_rgb(tdata)
         last_thermal_time = time.time()
 
     detect_frame = frame.copy()
