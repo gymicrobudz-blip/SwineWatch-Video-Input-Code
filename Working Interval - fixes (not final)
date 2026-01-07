@@ -1,0 +1,238 @@
+import cv2
+import numpy as np
+import time
+import os
+from tflite_runtime.interpreter import Interpreter
+from picamera2 import Picamera2
+
+# ================= USER CONFIG =================
+LIVE_PIG_INFERENCE = True     # TRUE = live pig boxes, FALSE = no live inference
+
+INTERVAL_MODE = "minute"
+INTERVAL_VALUE = 1
+SAVE_ROOT = "/home/asfrotect/Desktop/detections"
+
+INPUT_SIZE = 416
+SMALL_W = 320
+ROI_PAD = 0.15
+
+# ================= MODELS =================
+PIG_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/PigvsNONPig-v2_float16.tflite"
+BEHAVIOR_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/bestv8_behavior-2_float16.tflite"
+SKIN_MODEL = "/home/asfrotect/Projects/BYMS - TFLITE 3 COMBINED/ASFskin_NoPartsv3_v8s.tflite"
+
+PIG_CLASS_ID = 7
+HUMAN_CLASS_ID = 0
+
+PIG_CONF = 0.50
+LESION_CONF = 0.10
+REDNESS_CONF = 0.10
+
+BEHAVIOR_NAMES = {0: "ACTIVE", 1: "EATING", 2: "GROUP", 3: "INACTIVE"}
+SKIN_NAMES = {1: "ASF LESION", 2: "REDNESS"}
+
+# ================= PERFORMANCE =================
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
+# ================= HELPERS =================
+def preprocess(img):
+    img = cv2.resize(img, (INPUT_SIZE, INPUT_SIZE))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return (img.astype(np.float32) / 255.0)[None]
+
+def interval_seconds(mode, value):
+    return value * 60 if mode == "minute" else value * 3600
+
+def compute_iou(a, b):
+    xA, yA = max(a[0], b[0]), max(a[1], b[1])
+    xB, yB = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    areaA = max(0, a[2]-a[0]) * max(0, a[3]-a[1])
+    areaB = max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+    return inter / (areaA + areaB - inter + 1e-6)
+
+def nms(dets, thr):
+    dets = sorted(dets, key=lambda x: x[1], reverse=True)
+    out = []
+    while dets:
+        best = dets.pop(0)
+        out.append(best)
+        dets = [d for d in dets if compute_iou(best[0], d[0]) < thr]
+    return out
+
+def print_countdown(last, interval):
+    rem = int(interval - (time.time() - last))
+    rem = max(0, rem)
+    m, s = divmod(rem, 60)
+    print(f"\rNext capture in: {m:02d}:{s:02d}", end="")
+
+# ================= LOAD MODELS =================
+def load_model(path):
+    itp = Interpreter(model_path=path, num_threads=4)
+    itp.allocate_tensors()
+    return itp
+
+pig_itp = load_model(PIG_MODEL)
+beh_itp = load_model(BEHAVIOR_MODEL)
+skin_itp = load_model(SKIN_MODEL)
+
+pig_in, pig_out = pig_itp.get_input_details(), pig_itp.get_output_details()
+beh_in, beh_out = beh_itp.get_input_details(), beh_itp.get_output_details()
+skin_in, skin_out = skin_itp.get_input_details(), skin_itp.get_output_details()
+
+# ================= CAMERA =================
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(
+    main={"format": "RGB888", "size": (640, 480)}
+))
+picam2.start()
+
+# ================= INTERVAL =================
+INTERVAL_SEC = interval_seconds(INTERVAL_MODE, INTERVAL_VALUE)
+last_detection_time = time.time()
+os.makedirs(SAVE_ROOT, exist_ok=True)
+
+# ================= MAIN LOOP =================
+fps_t = time.time()
+
+while True:
+    frame = cv2.flip(picam2.capture_array(), 0)
+    H, W, _ = frame.shape
+    display = frame.copy()
+
+    # ========== LIVE PIG INFERENCE (OPTIONAL) ==========
+    pigs_live = []
+    if LIVE_PIG_INFERENCE:
+        small = cv2.resize(frame, (SMALL_W, int(H * SMALL_W / W)))
+        sx, sy = W / small.shape[1], H / small.shape[0]
+
+        pig_itp.set_tensor(pig_in[0]['index'], preprocess(small))
+        pig_itp.invoke()
+        preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
+
+        for d in preds:
+            x,y,bw,bh = d[:4]
+            scores = d[4:]
+            cid = int(np.argmax(scores))
+            conf = float(scores[cid])
+            if cid != PIG_CLASS_ID or conf < PIG_CONF:
+                continue
+
+            x1 = int((x-bw/2)*small.shape[1]*sx)
+            y1 = int((y-bh/2)*small.shape[0]*sy)
+            x2 = int((x+bw/2)*small.shape[1]*sx)
+            y2 = int((y+bh/2)*small.shape[0]*sy)
+
+            pigs_live.append(((x1,y1,x2,y2), conf))
+            cv2.rectangle(display,(x1,y1),(x2,y2),(0,255,0),2)
+            cv2.putText(display,f"PIG {conf:.2f}",
+                        (x1,y1-6),cv2.FONT_HERSHEY_SIMPLEX,0.45,(0,255,0),1)
+
+    # ========== FPS ==========
+    now = time.time()
+    fps = 1.0 / max(1e-6, now - fps_t)
+    fps_t = now
+    cv2.putText(display,f"FPS: {fps:.1f}",(10,30),
+                cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,255),2)
+
+    print_countdown(last_detection_time, INTERVAL_SEC)
+    cv2.imshow("ASF PI - Idle Mode", display)
+
+    if cv2.waitKey(1) == 27:
+        break
+
+    # ================= INTERVAL SAVE =================
+    if (now - last_detection_time) >= INTERVAL_SEC:
+
+        save_frame = frame.copy()
+
+        # ---- FULL INFERENCE DURING SAVE ----
+        small = cv2.resize(save_frame, (SMALL_W, int(H * SMALL_W / W)))
+        sx, sy = W / small.shape[1], H / small.shape[0]
+
+        pig_itp.set_tensor(pig_in[0]['index'], preprocess(small))
+        pig_itp.invoke()
+        preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
+
+        pigs = []
+        humans = []
+
+        for d in preds:
+            x,y,bw,bh = d[:4]
+            scores = d[4:]
+            cid = int(np.argmax(scores))
+            conf = float(scores[cid])
+            if conf < PIG_CONF:
+                continue
+
+            x1 = int((x-bw/2)*small.shape[1]*sx)
+            y1 = int((y-bh/2)*small.shape[0]*sy)
+            x2 = int((x+bw/2)*small.shape[1]*sx)
+            y2 = int((y+bh/2)*small.shape[0]*sy)
+
+            if cid == PIG_CLASS_ID:
+                pigs.append(((x1,y1,x2,y2), conf))
+            elif cid == HUMAN_CLASS_ID:
+                humans.append((x1,y1,x2,y2))
+
+        pigs = nms(pigs, 0.4)
+
+        for (x1,y1,x2,y2), conf in pigs:
+            roi = save_frame[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
+
+            beh_itp.set_tensor(beh_in[0]['index'], preprocess(roi))
+            beh_itp.invoke()
+            o = beh_itp.get_tensor(beh_out[0]['index'])[0].T
+            behavior = BEHAVIOR_NAMES[int(np.argmax(max(o, key=lambda d:max(d[4:]))[4:]))]
+
+            cv2.rectangle(save_frame,(x1,y1),(x2,y2),(0,255,0),2)
+            cv2.putText(save_frame,f"PIG {conf:.2f} | {behavior}",
+                        (x1,y1-6),cv2.FONT_HERSHEY_SIMPLEX,0.45,(0,255,0),1)
+
+            pw, ph = int((x2-x1)*ROI_PAD), int((y2-y1)*ROI_PAD)
+            px1, py1 = max(0,x1-pw), max(0,y1-ph)
+            px2, py2 = min(W,x2+pw), min(H,y2+ph)
+
+            skin_roi = save_frame[py1:py2, px1:px2]
+            if skin_roi.size == 0:
+                continue
+
+            skin_itp.set_tensor(skin_in[0]['index'], preprocess(skin_roi))
+            skin_itp.invoke()
+            outs = skin_itp.get_tensor(skin_out[0]['index'])[0].T
+
+            for d in outs:
+                x,y,bw,bh = d[:4]
+                scores = d[4:]
+                cid = int(np.argmax(scores))
+                conf = float(scores[cid])
+                if cid not in SKIN_NAMES:
+                    continue
+                if (cid==1 and conf<LESION_CONF) or (cid==2 and conf<REDNESS_CONF):
+                    continue
+
+                bx1 = int(px1+(x-bw/2)*(px2-px1))
+                by1 = int(py1+(y-bh/2)*(py2-py1))
+                bx2 = int(px1+(x+bw/2)*(px2-px1))
+                by2 = int(py1+(y+bh/2)*(py2-py1))
+
+                cv2.rectangle(save_frame,(bx1,by1),(bx2,by2),(0,0,255),2)
+                cv2.putText(save_frame,f"{SKIN_NAMES[cid]} {conf:.2f}",
+                            (bx1,by1-4),cv2.FONT_HERSHEY_SIMPLEX,0.4,(0,0,255),1)
+
+        date = time.strftime("%Y-%m-%d")
+        tstamp = time.strftime("%H-%M-%S")
+        save_dir = os.path.join(SAVE_ROOT, date)
+        os.makedirs(save_dir, exist_ok=True)
+
+        save_path = os.path.join(save_dir, f"{tstamp}.jpg")
+        cv2.imwrite(save_path, save_frame)
+
+        print(f"\n[SAVED] {save_path}")
+        last_detection_time = now
+
+picam2.stop()
+cv2.destroyAllWindows()
