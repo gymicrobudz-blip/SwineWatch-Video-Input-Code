@@ -1,0 +1,696 @@
+import cv2
+import numpy as np
+import time
+import os
+import cloudinary
+import cloudinary.uploader
+from tflite_runtime.interpreter import Interpreter
+from picamera2 import Picamera2
+import serial
+import firebase_admin
+from firebase_admin import credentials, db
+from flask import Flask, Response
+import threading
+import re
+
+# ================= FIREBASE =================
+cred = credentials.Certificate(
+    "/home/asfrotect/Projects/BYMS_TFLITE_3_COMBINED/firebase.json"
+)
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred, {
+        "databaseURL": "https://asfrotect-default-rtdb.asia-southeast1.firebasedatabase.app/"
+    })
+
+# ================= CLOUDINARY =================
+cloudinary.config(
+    cloud_name="dmjhw3xa2",
+    api_key="518441677687474",
+    api_secret="uWQqwVKVN7QZ_AcU5dWy4htZvR0",
+    secure=True
+)
+
+# ================= THERMAL =================
+try:
+    import board
+    import busio
+    import adafruit_mlx90640
+    from matplotlib import cm
+    THERMAL_AVAILABLE = True
+except Exception as e:
+    print("Thermal not available:", e)
+    THERMAL_AVAILABLE = False
+
+# ================= PERFORMANCE =================
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
+# ================= CONFIG =================
+INPUT_SIZE = 416
+SMALL_W = 320
+INTERVAL_MODE = "minute"
+INTERVAL_VALUE = 1
+SAVE_ROOT = "/home/asfrotect/Desktop/detections"
+PI_CAM_FPS = 0.0
+THERMAL_MIN_TEMP = 0.0
+THERMAL_MAX_TEMP = 0.0
+THERMAL_AVG_TEMP = 0.0
+
+# ================= INFERENCE FLAGS =================
+DRAW_PIG_BOXES = True     # Only affects visualization
+DRAW_BEHAVIOR_LABEL = True
+DRAW_SKIN_BOXES = True
+
+SHOW_OPENCV_WINDOW = False
+
+# ================= MODELS =================
+PIG_MODEL = "/home/asfrotect/Projects/BYMS_TFLITE_3_COMBINED/PigvsNONPig-v2_float16.tflite"
+BEHAVIOR_MODEL = "/home/asfrotect/Projects/BYMS_TFLITE_3_COMBINED/bestv8_behavior-2_float16.tflite"
+SKIN_MODEL = "/home/asfrotect/Projects/BYMS_TFLITE_3_COMBINED/ASFskin_NoPartsv3_v8s.tflite"
+
+PIG_CLASS_ID = 7
+HUMAN_CLASS_ID = 0
+
+PIG_CONF = 0.40
+LESION_CONF = 0.25
+REDNESS_CONF = 0.25
+
+BEHAVIOR_INTERVAL = 12
+ROI_PAD = 0.15
+
+BEHAVIOR_NAMES = {0:"ACTIVE",1:"EATING",2:"GROUP",3:"INACTIVE"}
+SKIN_NAMES = {1:"ASF LESION",2:"REDNESS"}
+
+# ===== ASF COUNTER =====
+asf_hour_count = 0
+current_hour_key = time.strftime("%Y-%m-%d %H-00")
+last_asf_push = time.time() 
+# ================= GSM =================
+GSM_PORT = "/dev/ttyAMA0"
+GSM_BAUD = 9600
+SMS_NUMBER = "+639369485057"
+SMS_TEMP_THRESHOLD = 40.0
+gsm = None
+
+# ================= HELPERS =================
+def preprocess(img):
+    img = cv2.resize(img, (INPUT_SIZE, INPUT_SIZE))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return (img.astype(np.float32) / 255.0)[None]
+
+def compute_iou(a, b):
+    xA, yA = max(a[0], b[0]), max(a[1], b[1])
+    xB, yB = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    areaA = max(0, a[2]-a[0]) * max(0, a[3]-a[1])
+    areaB = max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+    return inter / (areaA + areaB - inter + 1e-6)
+
+def nms_pig(dets, thr):
+    dets = sorted(dets, key=lambda x: x[1], reverse=True)
+    out = []
+    while dets:
+        best = dets.pop(0)
+        out.append(best)
+        dets = [d for d in dets if compute_iou(best[0], d[0]) < thr]
+    return out
+
+def nms_skin(dets, thr):
+    dets = sorted(dets, key=lambda x: x[1], reverse=True)
+    out = []
+    while dets:
+        best = dets.pop(0)
+        out.append(best)
+        dets = [d for d in dets if compute_iou(best[0], d[0]) < thr or best[2]!=d[2]]
+    return out
+
+def overlaps_any(box, boxes, thr=0.25):
+    return any(compute_iou(box,b)>thr for b in boxes)
+
+def pig_id(box):
+    x1,y1,x2,y2 = box
+    return (x1//30,y1//30,x2//30,y2//30)
+
+def interval_seconds(mode,value):
+    return value*60 if mode=="minute" else value*3600
+
+def print_countdown(last_time, interval_sec):
+    remaining = int(interval_sec - (time.time() - last_time))
+    remaining = max(0, remaining)
+    m,s = divmod(remaining,60)
+    print(f"\rNext capture in: {m:02d}:{s:02d}", end="")
+
+def upload_to_cloudinary(image_path, date):
+    try:
+        result = cloudinary.uploader.upload(
+            image_path,
+            folder=f"asfrotect_detections/{date}",
+            resource_type="image"
+        )
+        print("[CLOUDINARY UPLOADED]", result["secure_url"])
+        return result["secure_url"]
+    except Exception as e:
+        print("[CLOUDINARY ERROR]", e)
+        return None
+    
+def assign_pig_id(box):
+    global next_pig_id, pig_tracks
+
+    best_id = None
+    best_iou = 0.0
+
+    for pid, prev_box in pig_tracks.items():
+        iou = compute_iou(box, prev_box)
+        if iou > best_iou:
+            best_iou = iou
+            best_id = pid
+
+    if best_iou >= PIG_IOU_THRESHOLD:
+        pig_tracks[best_id] = box
+        return best_id
+    else:
+        pid = next_pig_id
+        pig_tracks[pid] = box
+        next_pig_id += 1
+        return pid
+
+def get_asf_status(asf_count):
+    if asf_count > 0:
+        return f"ASF DETECTED ({asf_count})"
+    else:
+        return "NORMAL"
+
+def push_asf_hourly_count():
+    try:
+        farm_id = "farm_001"
+        hour_key = time.strftime("%Y-%m-%d %H-00")
+        ref = db.reference(f"farms/{farm_id}/asf_hourly_counts")
+
+        # Status based on number of ASF boxes
+        status = get_asf_status(asf_hour_count)
+
+        ref.child(hour_key).set({
+            "asfCount": asf_hour_count,
+            "status": status,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    except Exception as e:
+        print("[FIREBASE ASF ERROR]", e)
+
+# ================= INFERENCE =================
+ASF_DETECTED = False
+pig_behaviors = {}
+# === LAST DETECTION CACHE (ADD THIS) ===
+last_detect_frame = None
+last_detect_time = None
+# ================= PIG TRACKING =================
+pig_tracks = {}        # pig_id -> last bbox
+next_pig_id = 0
+PIG_IOU_THRESHOLD = 0.5
+
+def run_full_inference(frame):
+    global ASF_DETECTED, asf_hour_count, current_hour_key
+    ASF_DETECTED = False
+    detect_frame = frame.copy()
+    pigs, humans = [], []
+
+    H,W,_ = frame.shape
+    small = cv2.resize(frame,(SMALL_W,int(H*SMALL_W/W)))
+    sx, sy = W/small.shape[1], H/small.shape[0]
+
+    # ----- Pig detection -----
+    pig_itp.set_tensor(pig_in[0]['index'], preprocess(small))
+    pig_itp.invoke()
+    preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
+    for d in preds:
+        x,y,bw,bh = d[:4]
+        scores = d[4:]
+        cid = int(np.argmax(scores))
+        conf = float(scores[cid])
+        if conf<PIG_CONF: continue
+
+        x1=int((x-bw/2)*small.shape[1]*sx)
+        y1=int((y-bh/2)*small.shape[0]*sy)
+        x2=int((x+bw/2)*small.shape[1]*sx)
+        y2=int((y+bh/2)*small.shape[0]*sy)
+
+        if cid==PIG_CLASS_ID:
+            pigs.append(((x1,y1,x2,y2),conf))
+        elif cid==HUMAN_CLASS_ID:
+            humans.append((x1,y1,x2,y2))
+    pigs = nms_pig(pigs,0.4)
+
+    # ----- Drawing + Skin -----
+    for (x1,y1,x2,y2),conf in pigs:
+        # Behavior label
+        pid = assign_pig_id((x1, y1, x2, y2))
+        label = ""
+        if pid not in pig_behaviors or frame_id - pig_behaviors[pid][1]>=BEHAVIOR_INTERVAL:
+            roi = frame[y1:y2,x1:x2]
+            if roi.size !=0:
+                beh_itp.set_tensor(beh_in[0]['index'], preprocess(roi))
+                beh_itp.invoke()
+                o = beh_itp.get_tensor(beh_out[0]['index'])[0].T
+                behavior = BEHAVIOR_NAMES[int(np.argmax(max(o,key=lambda d:max(d[4:]))[4:]))]
+                pig_behaviors[pid]=(behavior,frame_id)
+        label = pig_behaviors.get(pid, ("",))[0]
+
+        if DRAW_PIG_BOXES:
+            cv2.rectangle(detect_frame,(x1,y1),(x2,y2),(0,255,0),2)
+            cv2.putText(detect_frame,f"PIG {conf:.2f} {label}",(x1,y1-6),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.45,(0,255,0),1)
+
+        # Skin inference
+        pw,ph=int((x2-x1)*ROI_PAD),int((y2-y1)*ROI_PAD)
+        px1,py1=max(0,x1-pw),max(0,y1-ph)
+        px2,py2=min(W,x2+pw),min(H,y2+ph)
+        skin_roi = frame[py1:py2,px1:px2]
+        if skin_roi.size==0: continue
+        skin_itp.set_tensor(skin_in[0]['index'], preprocess(skin_roi))
+        skin_itp.invoke()
+        outs = skin_itp.get_tensor(skin_out[0]['index'])[0].T
+
+        dets=[]
+        for d in outs:
+            x,y,bw,bh=d[:4]
+            scores=d[4:]
+            cid=int(np.argmax(scores))
+            conf=float(scores[cid])
+            if (cid==1 and conf<LESION_CONF) or (cid==2 and conf<REDNESS_CONF): continue
+            if cid not in SKIN_NAMES: continue
+            rx1=int(px1+(x-bw/2)*(px2-px1))
+            ry1=int(py1+(y-bh/2)*(py2-py1))
+            rx2=int(px1+(x+bw/2)*(px2-px1))
+            ry2=int(py1+(y+bh/2)*(py2-py1))
+            if overlaps_any((rx1,ry1,rx2,ry2),humans): continue
+            dets.append(((rx1,ry1,rx2,ry2),conf,cid))
+
+        for (bx1,by1,bx2,by2),conf,cid in nms_skin(dets,0.45):
+            ASF_DETECTED=True
+            if ASF_DETECTED:
+                global asf_hour_count, current_hour_key
+                hour_key = time.strftime("%Y-%m-%d %H-00")
+                if hour_key != current_hour_key:
+                    asf_hour_count = 0
+                    current_hour_key = hour_key
+                asf_hour_count += 1
+
+            if DRAW_SKIN_BOXES:
+                cv2.rectangle(detect_frame,(bx1,by1),(bx2,by2),(0,0,255),2)
+                cv2.putText(detect_frame,f"{SKIN_NAMES[cid]} {conf:.2f}",
+                            (bx1,by1-4),cv2.FONT_HERSHEY_SIMPLEX,0.4,(0,0,255),1)
+    return detect_frame
+
+# ================= GSM =================
+def gsm_init():
+    global gsm
+    try:
+        gsm=serial.Serial(GSM_PORT,GSM_BAUD,timeout=2)
+        time.sleep(3)
+        gsm_send("AT")
+        gsm_send("ATE0")
+        gsm_send("AT+CMGF=1")
+        gsm_send("AT+CSQ")
+        gsm_send("AT+CREG?")
+        print("[GSM] Initialized")
+    except Exception as e:
+        print("[GSM ERROR]", e)
+        gsm=None
+
+def gsm_send(cmd,wait=1):
+    if gsm is None: return ""
+    gsm.write((cmd+"\r").encode())
+    time.sleep(wait)
+    return gsm.read_all().decode(errors="ignore")
+
+def send_sms(message):
+    if gsm is None: print("[SMS] GSM not initialized"); return
+    gsm_send(f'AT+CMGS="{SMS_NUMBER}"',0.5)
+    gsm.write(message.encode()+b"\x1A")
+    time.sleep(3)
+    resp=gsm.read_all().decode(errors="ignore")
+    if "+CMGS:" in resp: print("[SMS] SENT SUCCESSFULLY")
+    elif "ERROR" in resp: print("[SMS] FAILED:",resp.strip())
+    else: print("[SMS] MODEM RESPONSE:",resp.strip())
+
+# ================= THERMAL =================
+def draw_thermal_legend(img,tmin=20.0,tmax=40.0):
+    h,w,_=img.shape; bar_w,pad_x=20,10; y1,y2=50,h-60; x1,x2=w-bar_w-pad_x,w-pad_x
+    for i in range(y1,y2):
+        ratio=1.0-(i-y1)/(y2-y1)
+        temp=tmin+ratio*(tmax-tmin)
+        norm=(temp-tmin)/(tmax-tmin)
+        bgr=tuple(int(c*255) for c in reversed(cm.inferno(norm)[:3]))
+        cv2.line(img,(x1,i),(x2,i),bgr,1)
+    cv2.rectangle(img,(x1,y1),(x2,y2),(255,255,255),1)
+    for temp,y in [(tmax,y1+14),(tmin,y2-6)]:
+        label=f"{int(temp)} C"
+        (tw,_),_=cv2.getTextSize(label,cv2.FONT_HERSHEY_SIMPLEX,0.45,1)
+        cv2.putText(img,label,(x1-tw-8,y),cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,255,255),1)
+
+def draw_metadata_bar(img):
+    h,w,_=img.shape
+    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+    text=f"{timestamp} | Tmin: {THERMAL_MIN_TEMP:.1f} C | Tavg: {THERMAL_AVG_TEMP:.1f} C | Tmax: {THERMAL_MAX_TEMP:.1f} C"
+    bar_h=30
+    cv2.rectangle(img,(0,h-bar_h),(w,h),(0,0,0),-1)
+    cv2.putText(img,text,(10,h-8),cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),2,cv2.LINE_AA)
+
+# ================= LOAD MODELS =================
+def load_model(path):
+    itp=Interpreter(model_path=path,num_threads=4)
+    itp.allocate_tensors()
+    return itp
+
+def load_all_models():
+    pig=load_model(PIG_MODEL)
+    beh=load_model(BEHAVIOR_MODEL)
+    skin=load_model(SKIN_MODEL)
+    return (pig,beh,skin,
+            pig.get_input_details(),pig.get_output_details(),
+            beh.get_input_details(),beh.get_output_details(),
+            skin.get_input_details(),skin.get_output_details())
+
+# ================= CAMERA =================
+picam2=Picamera2()
+picam2.configure(
+    picam2.create_preview_configuration(main={"format":"RGB888","size":(640,480)},controls={"FrameRate":5})
+)
+picam2.start()
+
+pig_itp, beh_itp, skin_itp, \
+pig_in, pig_out, \
+beh_in, beh_out, \
+skin_in, skin_out = load_all_models()
+
+# ================= THERMAL INIT =================
+if THERMAL_AVAILABLE:
+    i2c=busio.I2C(board.SCL,board.SDA)
+    mlx90640=adafruit_mlx90640.MLX90640(i2c)
+    mlx90640.refresh_rate=adafruit_mlx90640.RefreshRate.REFRESH_4_HZ
+    thermal_frame=np.zeros((24*32,),dtype=float)
+
+last_thermal_time=0
+cached_thermal_resized=None
+thermal_lock=threading.Lock()
+
+def read_thermal():
+    global THERMAL_MIN_TEMP, THERMAL_MAX_TEMP, THERMAL_AVG_TEMP
+    try:
+        mlx90640.getFrame(thermal_frame)
+        data = thermal_frame.reshape((24, 32))
+
+        # ---- HARD FILTER (CRITICAL) ----
+        valid = data[
+            (data > 15.0) &    # below this is noise
+            (data < 42.0)      # pigs should NEVER exceed this
+        ]
+
+        # if frame is corrupted, ignore it
+        if valid.size < 100:
+            return None
+
+        # ---- ROBUST STATISTICS ----
+        THERMAL_MIN_TEMP = float(np.percentile(valid, 5))
+        THERMAL_MAX_TEMP = float(np.percentile(valid, 95))
+        THERMAL_AVG_TEMP = float(np.mean(valid))
+
+        return data
+
+    except RuntimeError as e:
+        print(f"[THERMAL WARNING] {e}")
+        return None
+
+def thermal_to_rgb(t):
+    tmin = max(20.0, THERMAL_MIN_TEMP)
+    tmax = min(42.0, THERMAL_MAX_TEMP)
+
+    norm = np.clip(
+        (t - tmin) / (tmax - tmin + 1e-6),
+        0, 1
+    )
+
+    return (cm.inferno(norm)[:, :, :3] * 255).astype(np.uint8)
+
+# ================= STREAM =================
+app=Flask(__name__)
+latest_frame=None
+frame_lock=threading.Lock()
+
+@app.route("/")
+def index():
+    print("[FLASK] / hit")  # <-- ADD THIS
+    return "FLASK IS WORKING"
+
+
+def generate_stream():
+    global latest_frame
+    print("[STREAM] Client connected")
+
+    while True:
+        with frame_lock:
+            frame = latest_frame
+
+        if frame is None:
+            time.sleep(0.1)
+            continue
+
+        ret, jpeg = cv2.imencode(".jpg", frame)
+        if not ret:
+            continue
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n" +
+            jpeg.tobytes() + b"\r\n"
+        )
+
+        time.sleep(0.05)
+
+@app.route("/video")
+def video():
+    return Response(
+        generate_stream(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "X-Accel-Buffering": "no"  # ?? CRITICAL
+        }
+    )
+
+threading.Thread(
+    target=lambda: app.run(host="0.0.0.0", port=8080, threaded=True),
+    daemon=True
+).start()
+
+time.sleep(2)  # allow Flask to start
+
+def get_cloudflare_url(log_path="/tmp/cloudflare.log", timeout=30):
+    import time, re, os
+
+    pattern = re.compile(r"https://[-\w]+\.trycloudflare\.com")
+    start = time.time()
+
+    while time.time() - start < timeout:
+        if os.path.exists(log_path):
+            with open(log_path, "r") as f:
+                for line in f:
+                    match = pattern.search(line)
+                    if match:
+                        return match.group(0)
+        time.sleep(1)
+
+    raise RuntimeError("Cloudflare URL not found in log")
+
+# ================= LIVE STREAM URL FROM CLOUDFLARE =================
+try:
+    STREAM_BASE_URL = get_cloudflare_url()
+    STREAM_URL = f"{STREAM_BASE_URL}/video"
+
+    db.reference("SwineWatchData/live_url").set(STREAM_URL)
+    print("[FIREBASE] Live stream URL updated:", STREAM_URL)
+
+except Exception as e:
+    print("[CLOUDFLARE URL ERROR]", e)
+
+def push_live_thermal_to_firebase():
+    try:
+        farm_id = "farm_001"
+        ref = db.reference(f"farms/{farm_id}/live_thermal")
+
+        ref.set({            
+            "avgTemp": round(THERMAL_AVG_TEMP, 1),
+            "fever": THERMAL_AVG_TEMP >= SMS_TEMP_THRESHOLD,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    except Exception as e:
+        print("[FIREBASE THERMAL ERROR]", e)
+
+
+def thermal_loop():
+    global cached_thermal_resized
+    last_firebase_push = 0
+
+    while True:
+        if THERMAL_AVAILABLE:
+            tdata = read_thermal()
+            if tdata is not None:
+                rgb = thermal_to_rgb(tdata)
+                rgb = cv2.resize(rgb, (640, 480))
+                draw_thermal_legend(rgb)
+
+                with thermal_lock:
+                    cached_thermal_resized = rgb
+
+                # ---- PUSH TO FIREBASE EVERY 5 SECONDS ----
+                if time.time() - last_firebase_push > 5:
+                    push_live_thermal_to_firebase()
+                    last_firebase_push = time.time()
+
+        time.sleep(0.8)
+
+threading.Thread(target=thermal_loop,daemon=True).start()
+
+# ================= MAIN LOOP ================
+INTERVAL_SEC = interval_seconds(INTERVAL_MODE, INTERVAL_VALUE)
+last_detection_time = time.time()
+frame_id = 0
+fps_t = time.time()
+os.makedirs(SAVE_ROOT, exist_ok=True)
+
+while True:
+    # Capture frame for preview only
+    frame = cv2.flip(picam2.capture_array(), 0)
+    frame_id += 1
+
+    # Thermal overlay
+    with thermal_lock:
+        thermal_img = cached_thermal_resized
+
+    # FAST live preview (NO inference)
+    preview = frame.copy()
+
+    # ipakita ang huling detection kung meron
+    if last_detect_frame is not None and time.time() - last_detection_time < 5:
+        preview = last_detect_frame.copy()
+        cv2.putText(
+            preview,
+            "LAST DETECTION",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2
+        )
+
+    # thermal side-by-side
+    if thermal_img is not None:
+        preview = cv2.hconcat([preview, thermal_img])
+
+    # Draw metadata
+    draw_metadata_bar(preview)
+
+    # Update streaming frame
+    with frame_lock:
+        latest_frame = preview.copy()
+
+    # Show window if enabled
+    if SHOW_OPENCV_WINDOW:
+        cv2.imshow("Preview", preview)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+        # ================= INTERVAL DETECTION =================
+    if time.time() - last_detection_time >= INTERVAL_SEC:
+        last_detection_time = time.time()
+
+        # --- inside main loop ---
+        if time.time() - last_asf_push > 60*60:  # 1 hour
+            push_asf_hourly_count()
+            last_asf_push = time.time()
+
+        detect_frame = run_full_inference(frame)
+
+        # cleanup pig tracking (prevent memory growth)
+        if len(pig_tracks) > 100:
+            pig_tracks.clear()
+            next_pig_id = 0
+
+        last_detect_frame = detect_frame.copy()
+        last_detect_time = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        cv2.putText(
+            last_detect_frame,
+            f"DETECTED @ {last_detect_time}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 0, 0),
+            2
+        )
+
+        # Combine with thermal for saving
+        with thermal_lock:
+            thermal_img = cached_thermal_resized
+
+        if thermal_img is not None:
+            combined = cv2.hconcat([detect_frame, thermal_img])
+        else:
+            combined = detect_frame
+
+        draw_metadata_bar(combined)
+
+        # Save locally
+        date = time.strftime("%Y-%m-%d")
+        tstamp = time.strftime("%H-%M-%S")
+        save_dir = os.path.join(SAVE_ROOT, date)
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"{tstamp}.jpg")
+        cv2.imwrite(save_path, combined)
+        print(f"[SAVED] {save_path}")
+
+        # Upload to Cloudinary
+        cloud_url = upload_to_cloudinary(save_path, date)
+
+        # Save to Firebase
+        if cloud_url:
+            hour_key = time.strftime("%H-00")
+            farm_id = "farm_001"
+            ref = db.reference(f"farms/{farm_id}/detections/{date}/{hour_key}")
+            ref.push({
+                "imageUrl": cloud_url,
+                "avgTemp": round(THERMAL_AVG_TEMP, 1),
+                "minTemp": round(THERMAL_MIN_TEMP, 1),
+                "maxTemp": round(THERMAL_MAX_TEMP, 1),
+                "asfDetected": ASF_DETECTED,
+                "fever": THERMAL_AVG_TEMP >= SMS_TEMP_THRESHOLD,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            })
+
+        # GSM alerts
+        if ASF_DETECTED or THERMAL_AVG_TEMP >= SMS_TEMP_THRESHOLD:
+            gsm_init()
+            if ASF_DETECTED:
+                send_sms(
+                    f"ASF ALERT!\nLesion/Redness detected.\nTime: {date} {tstamp}"
+                )
+            if THERMAL_AVG_TEMP >= SMS_TEMP_THRESHOLD:
+                send_sms(
+                    f"TEMP ALERT!\nAvg Temp: {THERMAL_AVG_TEMP:.1f} C\nTime: {date} {tstamp}"
+                )
+            if gsm:
+                gsm.close()
+                gsm = None
+
+
+
+    # FPS display
+    now = time.time()
+    PI_CAM_FPS = 1.0 / max(1e-6, now - fps_t)
+    fps_t = now
+    print(f"\rPi FPS: {PI_CAM_FPS:.1f}", end="")
