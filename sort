@@ -11,8 +11,8 @@ import firebase_admin
 from firebase_admin import credentials, db
 from flask import Flask, Response
 import threading
-import subprocess
-from flask import send_from_directory
+import re
+from filterpy.kalman import KalmanFilter
 
 # ================= FIREBASE =================
 cred = credentials.Certificate(
@@ -82,6 +82,18 @@ ROI_PAD = 0.15
 BEHAVIOR_NAMES = {0:"ACTIVE",1:"EATING",2:"GROUP",3:"INACTIVE"}
 SKIN_NAMES = {1:"ASF LESION",2:"REDNESS"}
 
+# ================= SORT-LIKE PIG TRACKING =================
+pig_tracks = {}          # pig_id -> PigKalman
+pig_last_seen = {}       # pig_id -> timestamp
+next_pig_id = 0
+
+PIG_IOU_THRESHOLD = 0.4
+PIG_TIMEOUT = 10  # seconds
+
+# ===== ASF COUNTER =====
+asf_hour_count = 0
+current_hour_key = time.strftime("%Y-%m-%d %H-00")
+last_asf_push = time.time() 
 # ================= GSM =================
 GSM_PORT = "/dev/ttyAMA0"
 GSM_BAUD = 9600
@@ -151,26 +163,91 @@ def upload_to_cloudinary(image_path, date):
         return None
     
 def assign_pig_id(box):
-    global next_pig_id, pig_tracks
+    global next_pig_id
 
     best_id = None
     best_iou = 0.0
 
-    for pid, prev_box in pig_tracks.items():
-        iou = compute_iou(box, prev_box)
+    for pid, tracker in pig_tracks.items():
+        pred_box = tracker.predict()
+        iou = compute_iou(box, pred_box)
+        print(f"[SORT] Compare with pig {pid}, IOU={iou:.2f}")
         if iou > best_iou:
             best_iou = iou
             best_id = pid
 
     if best_iou >= PIG_IOU_THRESHOLD:
-        pig_tracks[best_id] = box
+        print(f"[SORT] MATCH pig {best_id} (IOU={best_iou:.2f})")
+        pig_tracks[best_id].update(box)
+        pig_last_seen[best_id] = time.time()
         return best_id
-    else:
-        pid = next_pig_id
-        pig_tracks[pid] = box
-        next_pig_id += 1
-        return pid
 
+    pid = next_pig_id
+    print(f"[SORT] NEW pig {pid}")
+    next_pig_id += 1
+    pig_tracks[pid] = PigKalman(box)
+    pig_last_seen[pid] = time.time()
+    return pid
+
+def get_asf_status(asf_count):
+    if asf_count > 0:
+        return f"ASF DETECTED ({asf_count})"
+    else:
+        return "NORMAL"
+
+def push_asf_hourly_count():
+    try:
+        farm_id = "farm_001"
+        hour_key = time.strftime("%Y-%m-%d %H-00")
+        ref = db.reference(f"farms/{farm_id}/asf_hourly_counts")
+
+        # Status based on number of ASF boxes
+        status = get_asf_status(asf_hour_count)
+
+        ref.child(hour_key).set({
+            "asfCount": asf_hour_count,
+            "status": status,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    except Exception as e:
+        print("[FIREBASE ASF ERROR]", e)
+
+class PigKalman:
+    def __init__(self, bbox):
+        self.kf = KalmanFilter(dim_x=8, dim_z=4)
+
+        # state = cx, cy, w, h, dx, dy, dw, dh
+        self.kf.F = np.eye(8)
+        for i in range(4):
+            self.kf.F[i, i+4] = 1
+
+        self.kf.H = np.eye(4, 8)
+        self.kf.R *= 10
+        self.kf.P *= 1000
+        self.kf.Q *= 0.01
+
+        x1, y1, x2, y2 = bbox
+        w, h = x2 - x1, y2 - y1
+        cx, cy = x1 + w / 2, y1 + h / 2
+
+        self.kf.x[:4] = [[cx], [cy], [w], [h]]
+
+    def predict(self):
+        self.kf.predict()
+        cx, cy, w, h = self.kf.x[:4].flatten()
+        return (
+            int(cx - w / 2),
+            int(cy - h / 2),
+            int(cx + w / 2),
+            int(cy + h / 2)
+        )
+
+    def update(self, bbox):
+        x1, y1, x2, y2 = bbox
+        w, h = x2 - x1, y2 - y1
+        cx, cy = x1 + w / 2, y1 + h / 2
+        self.kf.update([cx, cy, w, h])
 
 # ================= INFERENCE =================
 ASF_DETECTED = False
@@ -184,7 +261,7 @@ next_pig_id = 0
 PIG_IOU_THRESHOLD = 0.5
 
 def run_full_inference(frame):
-    global ASF_DETECTED
+    global ASF_DETECTED, asf_hour_count, current_hour_key
     ASF_DETECTED = False
     detect_frame = frame.copy()
     pigs, humans = [], []
@@ -231,9 +308,16 @@ def run_full_inference(frame):
         label = pig_behaviors.get(pid, ("",))[0]
 
         if DRAW_PIG_BOXES:
-            cv2.rectangle(detect_frame,(x1,y1),(x2,y2),(0,255,0),2)
-            cv2.putText(detect_frame,f"PIG {conf:.2f} {label}",(x1,y1-6),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.45,(0,255,0),1)
+            cv2.rectangle(detect_frame, (x1, y1), (x2, y2), (0,255,0), 2)
+            cv2.putText(
+                detect_frame,
+                f"PIG ID:{pid} {conf:.2f} {label}",
+                (x1, y1 - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 0),
+                1
+            )
 
         # Skin inference
         pw,ph=int((x2-x1)*ROI_PAD),int((y2-y1)*ROI_PAD)
@@ -262,6 +346,14 @@ def run_full_inference(frame):
 
         for (bx1,by1,bx2,by2),conf,cid in nms_skin(dets,0.45):
             ASF_DETECTED=True
+            if ASF_DETECTED:
+                global asf_hour_count, current_hour_key
+                hour_key = time.strftime("%Y-%m-%d %H-00")
+                if hour_key != current_hour_key:
+                    asf_hour_count = 0
+                    current_hour_key = hour_key
+                asf_hour_count += 1
+
             if DRAW_SKIN_BOXES:
                 cv2.rectangle(detect_frame,(bx1,by1),(bx2,by2),(0,0,255),2)
                 cv2.putText(detect_frame,f"{SKIN_NAMES[cid]} {conf:.2f}",
@@ -345,27 +437,6 @@ picam2.configure(
 )
 picam2.start()
 
-# ================= START HLS ENCODER =================
-ffmpeg_cmd = [
-    "ffmpeg",
-    "-y",
-    "-f", "rawvideo",
-    "-pix_fmt", "bgr24",
-    "-s", HLS_SIZE,
-    "-r", str(HLS_FPS),
-    "-i", "-",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-tune", "zerolatency",
-    "-f", "hls",
-    "-hls_time", "1",
-    "-hls_list_size", "4",
-    "-hls_flags", "delete_segments",
-    os.path.join(HLS_DIR, HLS_FILE)
-]
-
-ffmpeg = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-
 pig_itp, beh_itp, skin_itp, \
 pig_in, pig_out, \
 beh_in, beh_out, \
@@ -383,20 +454,42 @@ cached_thermal_resized=None
 thermal_lock=threading.Lock()
 
 def read_thermal():
-    global THERMAL_MIN_TEMP,THERMAL_MAX_TEMP,THERMAL_AVG_TEMP
+    global THERMAL_MIN_TEMP, THERMAL_MAX_TEMP, THERMAL_AVG_TEMP
     try:
         mlx90640.getFrame(thermal_frame)
-        data=thermal_frame.reshape((24,32))
-        THERMAL_MIN_TEMP=float(np.min(data))
-        THERMAL_MAX_TEMP=float(np.max(data))
-        THERMAL_AVG_TEMP=float(np.mean(data))
+        data = thermal_frame.reshape((24, 32))
+
+        # ---- HARD FILTER (CRITICAL) ----
+        valid = data[
+            (data > 15.0) &    # below this is noise
+            (data < 42.0)      # pigs should NEVER exceed this
+        ]
+
+        # if frame is corrupted, ignore it
+        if valid.size < 100:
+            return None
+
+        # ---- ROBUST STATISTICS ----
+        THERMAL_MIN_TEMP = float(np.percentile(valid, 5))
+        THERMAL_MAX_TEMP = float(np.percentile(valid, 95))
+        THERMAL_AVG_TEMP = float(np.mean(valid))
+
         return data
-    except RuntimeError as e:
+
+    except (RuntimeError, OSError) as e:
         print(f"[THERMAL WARNING] {e}")
         return None
 
 def thermal_to_rgb(t):
-    return (cm.inferno(np.clip((t-20)/20,0,1))[:,:,:3]*255).astype(np.uint8)
+    tmin = max(20.0, THERMAL_MIN_TEMP)
+    tmax = min(42.0, THERMAL_MAX_TEMP)
+
+    norm = np.clip(
+        (t - tmin) / (tmax - tmin + 1e-6),
+        0, 1
+    )
+
+    return (cm.inferno(norm)[:, :, :3] * 255).astype(np.uint8)
 
 # ================= STREAM =================
 app=Flask(__name__)
@@ -405,60 +498,129 @@ frame_lock=threading.Lock()
 
 @app.route("/")
 def index():
-    return "<h2>ASFrotect Camera Stream</h2><img src='/video'>"
+    print("[FLASK] / hit")  # <-- ADD THIS
+    return "FLASK IS WORKING"
 
 
 def generate_stream():
     global latest_frame
+    print("[STREAM] Client connected")
+
     while True:
         with frame_lock:
-            frame=latest_frame
+            frame = latest_frame
+
         if frame is None:
-            time.sleep(0.3)
+            time.sleep(0.1)
             continue
-        ret,jpeg=cv2.imencode(".jpg",frame)
-        if not ret: continue
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"+jpeg.tobytes()+b"\r\n")
+
+        ret, jpeg = cv2.imencode(".jpg", frame)
+        if not ret:
+            continue
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n" +
+            jpeg.tobytes() + b"\r\n"
+        )
+
+        time.sleep(0.05)
 
 @app.route("/video")
 def video():
-    return Response(generate_stream(),mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(
+        generate_stream(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "X-Accel-Buffering": "no"  # ?? CRITICAL
+        }
+    )
 
-@app.route("/hls/<path:filename>")
-def hls_files(filename):
-    return send_from_directory(HLS_DIR, filename)
+threading.Thread(
+    target=lambda: app.run(host="0.0.0.0", port=8080, threaded=True),
+    daemon=True
+).start()
 
-threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080, threaded=True),daemon=True).start()
-# ================= LIVE STREAM URL TO FIREBASE =================
-RPI_IP = "192.168.18.99"   # ito yung nakuha mo sa `hostname -I`
-STREAM_URL = "https://panels-last-outdoors-zinc.trycloudflare.com/hls/stream.m3u8"
-db.reference("SwineWatchData/live_url").set(STREAM_URL)
-print("[FIREBASE] Live stream URL updated:", STREAM_URL)
+time.sleep(2)  # allow Flask to start
 
-# ================= HLS CONFIG =================
-HLS_DIR = "/tmp/hls"
-HLS_FILE = "stream.m3u8"
-HLS_FPS = 5
-HLS_SIZE = "640x480"
+def get_cloudflare_url(log_path="/tmp/cloudflare.log", timeout=30):
+    import time, re, os
 
-os.makedirs(HLS_DIR, exist_ok=True)
+    pattern = re.compile(r"https://[-\w]+\.trycloudflare\.com")
+    start = time.time()
+
+    while time.time() - start < timeout:
+        if os.path.exists(log_path):
+            with open(log_path, "r") as f:
+                for line in f:
+                    match = pattern.search(line)
+                    if match:
+                        return match.group(0)
+        time.sleep(1)
+
+    raise RuntimeError("Cloudflare URL not found in log")
+
+# ================= LIVE STREAM URL FROM CLOUDFLARE =================
+try:
+    STREAM_BASE_URL = get_cloudflare_url()
+    STREAM_URL = f"{STREAM_BASE_URL}/video"
+
+    db.reference("SwineWatchData/live_url").set(STREAM_URL)
+    print("[FIREBASE] Live stream URL updated:", STREAM_URL)
+
+except Exception as e:
+    print("[CLOUDFLARE URL ERROR]", e)
+
+def push_live_thermal_to_firebase():
+    try:
+        farm_id = "farm_001"
+        ref = db.reference(f"farms/{farm_id}/live_thermal")
+
+        ref.set({            
+            "avgTemp": round(THERMAL_AVG_TEMP, 1),
+            "fever": THERMAL_AVG_TEMP >= SMS_TEMP_THRESHOLD,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    except Exception as e:
+        print("[FIREBASE THERMAL ERROR]", e)
+
 
 def thermal_loop():
     global cached_thermal_resized
+    last_firebase_push = 0
+
     while True:
         if THERMAL_AVAILABLE:
-            tdata=read_thermal()
+            try:
+                tdata = read_thermal()
+            except OSError as e:
+                print("[THERMAL I2C ERROR]", e)
+                time.sleep(1)
+                continue
+
             if tdata is not None:
-                rgb=thermal_to_rgb(tdata)
-                rgb=cv2.resize(rgb,(640,480))
-                rgb=cv2.flip(rgb,0)
+                rgb = thermal_to_rgb(tdata)
+                rgb = cv2.resize(rgb, (640, 480))
                 draw_thermal_legend(rgb)
+
                 with thermal_lock:
-                    cached_thermal_resized=rgb
-        time.sleep(10)
+                    cached_thermal_resized = rgb
+
+                # ---- PUSH TO FIREBASE EVERY 5 SECONDS ----
+                if time.time() - last_firebase_push > 5:
+                    push_live_thermal_to_firebase()
+                    last_firebase_push = time.time()
+
+        time.sleep(0.8)
+
 threading.Thread(target=thermal_loop,daemon=True).start()
 
-# ================= MAIN LOOP =================
+# ================= MAIN LOOP ================
 INTERVAL_SEC = interval_seconds(INTERVAL_MODE, INTERVAL_VALUE)
 last_detection_time = time.time()
 frame_id = 0
@@ -467,7 +629,7 @@ os.makedirs(SAVE_ROOT, exist_ok=True)
 
 while True:
     # Capture frame for preview only
-    frame = cv2.flip(picam2.capture_array(), 0)
+    frame = picam2.capture_array()
     frame_id += 1
 
     # Thermal overlay
@@ -501,11 +663,6 @@ while True:
     with frame_lock:
         latest_frame = preview.copy()
 
-    try:
-        ffmpeg.stdin.write(preview.tobytes())
-    except BrokenPipeError:
-        print("[HLS] FFmpeg pipe broken")
-
     # Show window if enabled
     if SHOW_OPENCV_WINDOW:
         cv2.imshow("Preview", preview)
@@ -516,7 +673,24 @@ while True:
     if time.time() - last_detection_time >= INTERVAL_SEC:
         last_detection_time = time.time()
 
+        # --- inside main loop ---
+        if time.time() - last_asf_push > 60*60:  # 1 hour
+            push_asf_hourly_count()
+            last_asf_push = time.time()
+
         detect_frame = run_full_inference(frame)
+
+        now = time.time()
+        for pid in list(pig_last_seen.keys()):
+            if now - pig_last_seen[pid] > PIG_TIMEOUT:
+                pig_tracks.pop(pid, None)
+                pig_last_seen.pop(pid, None)
+
+        # emergency cleanup
+        if len(pig_tracks) > 100:
+            pig_tracks.clear()
+            pig_last_seen.clear()
+            next_pig_id = 0
 
         # cleanup pig tracking (prevent memory growth)
         if len(pig_tracks) > 100:
