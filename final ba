@@ -467,24 +467,17 @@ def load_all_models():
             beh.get_input_details(),beh.get_output_details(),
             skin.get_input_details(),skin.get_output_details())
 
-def force_16_9(frame):
-    h, w, _ = frame.shape
-    target_ratio = 16 / 9
-    current_ratio = w / h
+def letterbox(img, target_w=1280, target_h=720):
+    h, w = img.shape[:2]
+    scale = min(target_w/w, target_h/h)
+    nw, nh = int(w*scale), int(h*scale)
+    resized = cv2.resize(img, (nw, nh))
 
-    if abs(current_ratio - target_ratio) < 0.01:
-        return frame
-
-    if current_ratio > target_ratio:
-        # too wide ? crop width
-        new_w = int(h * target_ratio)
-        x1 = (w - new_w) // 2
-        return frame[:, x1:x1 + new_w]
-    else:
-        # too tall ? crop height
-        new_h = int(w / target_ratio)
-        y1 = (h - new_h) // 2
-        return frame[y1:y1 + new_h, :]
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    x = (target_w - nw) // 2
+    y = (target_h - nh) // 2
+    canvas[y:y+nh, x:x+nw] = resized
+    return canvas
 
 # ================= CAMERA =================
 picam2=Picamera2()
@@ -825,7 +818,8 @@ while True:
 
     # Update streaming frame
     with frame_lock:
-        preview = force_16_9(preview)
+        if thermal_img is None:
+            preview = letterbox(preview)   # crop ONLY camera-only view
         preview = cv2.resize(preview, (1280, 720))
         latest_frame = preview.copy()
 
