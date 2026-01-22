@@ -50,7 +50,7 @@ cv2.ocl.setUseOpenCL(False)
 # ================= CONFIG =================
 INPUT_SIZE = 416
 SMALL_W = 320
-INTERVAL_MODE = "hour"
+INTERVAL_MODE = "minute"
 INTERVAL_VALUE = 1
 SAVE_ROOT = "/home/asfrotect/Desktop/detections"
 PI_CAM_FPS = 0.0
@@ -77,14 +77,14 @@ behavior_hourly = {}   # hour_key -> True/False
 FEVER_PERSIST_HOURS = 3   # X hours (change as needed)
 # --- GLOBAL (add once) ---
 thermal_ema = None
-THERMAL_ALPHA = 0.2  # temporal smoothing (0.1ï¿½0.3)
+THERMAL_ALPHA = 0.2  # temporal smoothing (0.1Ã¯Â¿Â½0.3)
 
 thermal_hourly_samples = {}  # hour_key -> list of temps
 gsm_initialized = False
 
 # ================= MODELS =================
 PIG_MODEL = "/home/asfrotect/Projects/BYMS_TFLITE_3_COMBINED/PigvsNONPig-v2_float16.tflite"
-BEHAVIOR_MODEL = "/home/asfrotect/Projects/BYMS_TFLITE_3_COMBINED/bestv8_behavior-2_float16.tflite"
+BEHAVIOR_MODEL = "/home/asfrotect/Projects/BYMS_TFLITE_3_COMBINED/LucbanBehaviorV2_int8.tflite"
 SKIN_MODEL = "/home/asfrotect/Projects/BYMS_TFLITE_3_COMBINED/ASFskin_NoPartsv3_v8s.tflite"
 
 PIG_CLASS_ID = 7
@@ -120,7 +120,7 @@ BEHAVIOR_ALERT = False
 ABNORMAL_BEHAVIORS = {"INACTIVE"}  # add more if needed
 
 # ================= FEVER LOGIC =================
-FEVER_DELTA_C = 2.0          # >= 2ï¿½C rise indicates fever
+FEVER_DELTA_C = 2.0          # >= 2Ã¯Â¿Â½C rise indicates fever
 thermal_hourly_avg = {}     # hour_key -> avgTemp
 
 # ================= GSM =================
@@ -364,7 +364,7 @@ def run_full_inference(frame,fraemme_id):
             cv2.rectangle(detect_frame, (x1, y1), (x2, y2), (0,255,0), 2)
             cv2.putText(
                 detect_frame,
-                f"PIG ID:{pid} {conf:.2f} {label}",
+                f"{conf:.2f} {label}",
                 (x1, y1 - 6),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,
@@ -758,7 +758,7 @@ def push_live_thermal_to_firebase():
         ref = db.reference(f"farms/{farm_id}/live_thermal")
 
         ref.set({            
-            "avgTemp": round(THERMAL_MAX_TEMP, 1),
+            "maxTemp": round(THERMAL_MAX_TEMP, 1),
             "fever": THERMAL_MAX_TEMP >= ABSOLUTE_FEVER_C,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         })
@@ -928,7 +928,7 @@ while True:
 
             if delta >= FEVER_DELTA_C:
                 fever_detected = True
-                print(f"[FEVER] Temp increased by {delta:.2f}ï¿½C")
+                print(f"[FEVER] Temp increased by {delta:.2f}Ã¯Â¿Â½C")
 
         fever_hourly[hour_key] = fever_detected
 
@@ -1079,7 +1079,7 @@ while True:
                 if fever_detected or persistent_fever:
                     send_sms(
                         f"FEVER ALERT!\n"
-                        f"Avg Temp: {THERMAL_MAX_TEMP:.1f} C\n"
+                        f"Max Temp: {THERMAL_MAX_TEMP:.1f} C\n"
                         f"Persistent: {'YES' if persistent_fever else 'NO'}\n"
                         f"Time: {date} {tstamp}"
                     )
