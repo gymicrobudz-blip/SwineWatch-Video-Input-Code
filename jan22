@@ -262,6 +262,27 @@ def push_asf_hourly_count():
     except Exception as e:
         print("[FIREBASE ASF ERROR]", e)
 
+def push_hourly_behavior_counts():
+    try:
+        farm_id = "farm_001"
+        hour_key = time.strftime("%Y-%m-%d %H-00")
+
+        data = behavior_counts_hourly.get(hour_key, {})
+
+        payload = {
+            behavior: len(pigs)
+            for behavior, pigs in data.items()
+        }
+
+        payload["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        db.reference(
+            f"farms/{farm_id}/behavior_hourly/{hour_key}"
+        ).update(payload)
+
+    except Exception as e:
+        print("[FIREBASE BEHAVIOR HOURLY ERROR]", e)
+
 def push_monitored_pigs():
     try:
         farm_id = "farm_001"
@@ -338,9 +359,6 @@ pig_behaviors = {}
 # === LAST DETECTION CACHE (ADD THIS) ===
 last_detect_frame = None
 last_detect_time = None
-# ================= PIG TRACKING =================
-next_pig_id = 0
-PIG_IOU_THRESHOLD = 0.5
 
 def run_full_inference(frame,fraemme_id):
     global ASF_DETECTED, asf_hour_count, current_hour_key, BEHAVIOR_ALERT
@@ -396,6 +414,16 @@ def run_full_inference(frame,fraemme_id):
                 o = beh_itp.get_tensor(beh_out[0]['index'])[0].T
                 behavior = BEHAVIOR_NAMES[int(np.argmax(max(o,key=lambda d:max(d[4:]))[4:]))]
                 pig_behaviors[pid]=(behavior,frame_id)
+                # ---- HOURLY BEHAVIOR COUNTING ----
+                hour_key = time.strftime("%Y-%m-%d %H-00")
+
+                if hour_key not in behavior_counts_hourly:
+                    behavior_counts_hourly[hour_key] = {
+                        name: set() for name in BEHAVIOR_NAMES.values()
+                    }
+
+                behavior_counts_hourly[hour_key][behavior].add(pid)
+
                 if behavior in ABNORMAL_BEHAVIORS:
                     BEHAVIOR_ALERT = True
         label = pig_behaviors.get(pid, ("",))[0]
@@ -933,6 +961,7 @@ while True:
             last_asf_push = time.time()
 
         detect_frame = run_full_inference(frame, frame_id)
+        push_hourly_behavior_counts()
         push_monitored_pigs()
         save_pig_state()
 
@@ -987,6 +1016,12 @@ while True:
         lesion_hourly[hour_key] = ASF_DETECTED
         behavior_hourly[hour_key] = BEHAVIOR_ALERT
 
+        # ---- KEEP LAST 24 HOURS OF BEHAVIOR COUNTS ----
+        if len(behavior_counts_hourly) > 24:
+            for k in sorted(behavior_counts_hourly.keys())[:-24]:
+                behavior_counts_hourly.pop(k)
+
+        # ---- KEEP LAST 24 HOURS OF BOOLEAN HISTORIES ----
         for history in [fever_hourly, lesion_hourly, behavior_hourly]:
             if len(history) > 24:
                 for k in sorted(history.keys())[:-24]:
