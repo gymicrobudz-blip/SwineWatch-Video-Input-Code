@@ -4,7 +4,8 @@ import time
 import os
 import cloudinary
 import cloudinary.uploader
-from tflite_runtime.interpreter import Interpreter
+import torch
+import torchvision.transforms as T
 from picamera2 import Picamera2
 import serial
 import firebase_admin
@@ -147,10 +148,16 @@ ABSOLUTE_FEVER_C = SMS_TEMP_THRESHOLD  # reuse GSM threshold
 gsm = None
 
 # ================= HELPERS =================
+transform = T.Compose([
+    T.ToPILImage(),
+    T.Resize((INPUT_SIZE, INPUT_SIZE)),
+    T.ToTensor(),
+])
+
 def preprocess(img):
-    img = cv2.resize(img, (INPUT_SIZE, INPUT_SIZE))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return (img.astype(np.float32) / 255.0)[None]
+    tensor = transform(img).unsqueeze(0).to(DEVICE)
+    return tensor
 
 def compute_iou(a, b):
     xA, yA = max(a[0], b[0]), max(a[1], b[1])
@@ -411,9 +418,8 @@ def run_full_inference(frame,frame_id):
     sx, sy = W/small.shape[1], H/small.shape[0]
 
     # ----- Pig detection -----
-    pig_itp.set_tensor(pig_in[0]['index'], preprocess(small))
-    pig_itp.invoke()
-    preds = pig_itp.get_tensor(pig_out[0]['index'])[0].T
+    with torch.no_grad():
+        preds = pig_model(preprocess(small))[0].cpu().numpy().T
     for d in preds:
         x,y,bw,bh = d[:4]
         scores = d[4:]
@@ -447,9 +453,8 @@ def run_full_inference(frame,frame_id):
         if pid not in pig_behaviors or frame_id - pig_behaviors[pid][1]>=BEHAVIOR_INTERVAL:
             roi = frame[y1:y2,x1:x2]
             if roi.size !=0:
-                beh_itp.set_tensor(beh_in[0]['index'], preprocess(roi))
-                beh_itp.invoke()
-                o = beh_itp.get_tensor(beh_out[0]['index'])[0].T
+                with torch.no_grad():
+                    o = beh_model(preprocess(roi))[0].cpu().numpy().T
                 behavior = BEHAVIOR_NAMES[int(np.argmax(max(o,key=lambda d:max(d[4:]))[4:]))]
                 pig_behaviors[pid]=(behavior,frame_id)
                 # ---- HOURLY BEHAVIOR COUNTING ----
@@ -484,10 +489,8 @@ def run_full_inference(frame,frame_id):
         px2,py2=min(W,x2+pw),min(H,y2+ph)
         skin_roi = frame[py1:py2,px1:px2]
         if skin_roi.size==0: continue
-        skin_itp.set_tensor(skin_in[0]['index'], preprocess(skin_roi))
-        skin_itp.invoke()
-        outs = skin_itp.get_tensor(skin_out[0]['index'])[0].T
-
+        with torch.no_grad():
+            outs = skin_model(preprocess(skin_roi))[0].cpu().numpy().T
         dets=[]
         for d in outs:
             x,y,bw,bh=d[:4]
@@ -588,19 +591,18 @@ def save_pig_state():
     np.save(PIG_STATE_PATH, data)
 
 # ================= LOAD MODELS =================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 def load_model(path):
-    itp=Interpreter(model_path=path,num_threads=4)
-    itp.allocate_tensors()
-    return itp
+    model = torch.jit.load(path, map_location=DEVICE)  # expects TorchScript
+    model.eval()
+    return model
 
 def load_all_models():
-    pig=load_model(PIG_MODEL)
-    beh=load_model(BEHAVIOR_MODEL)
-    skin=load_model(SKIN_MODEL)
-    return (pig,beh,skin,
-            pig.get_input_details(),pig.get_output_details(),
-            beh.get_input_details(),beh.get_output_details(),
-            skin.get_input_details(),skin.get_output_details())
+    pig = load_model(PIG_MODEL)
+    beh = load_model(BEHAVIOR_MODEL)
+    skin = load_model(SKIN_MODEL)
+    return pig, beh, skin
 
 def letterbox(img, target_w=1280, target_h=720):
     h, w = img.shape[:2]
@@ -630,10 +632,7 @@ picam2.configure(
 )
 picam2.start()
 
-pig_itp, beh_itp, skin_itp, \
-pig_in, pig_out, \
-beh_in, beh_out, \
-skin_in, skin_out = load_all_models()
+pig_model, beh_model, skin_model = load_all_models()
 
 # ================= RESTORE PIG TRACK STATE =================
 PIG_STATE_PATH = "/home/asfrotect/Desktop/pig_state.npy"
