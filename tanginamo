@@ -559,9 +559,21 @@ def send_sms(message):
         return
 
     for number in SMS_NUMBERS:
-        gsm_send(f'AT+CMGS="{number}"', 0.5)
+        print(f"[SMS] Sending to {number}...")
+
+        resp = gsm_send(f'AT+CMGS="{number}"', 0.5)
+        print("[GSM] CMGS response:", resp.strip())
+
         gsm.write(message.encode() + b"\x1A")
         time.sleep(3)
+
+        final = gsm.read_all().decode(errors="ignore")
+        print("[GSM] Final response:", final.strip())
+
+        if "OK" in final or "+CMGS" in final:
+            print("[SMS] Sent successfully")
+        else:
+            print("[SMS] Send may have failed")
 
 def format_status_block(fever, lesion, behavior):
     return (
