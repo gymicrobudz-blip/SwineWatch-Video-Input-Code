@@ -565,11 +565,14 @@ def send_sms(message):
 
 def format_status_block(fever, lesion, behavior):
     return (
-        f"CURRENT STATUS:\n"
-        f"- Fever: {'YES' if fever else 'NO'} (Max {THERMAL_MAX_TEMP:.1f} C)\n"
-        f"- Lesion: {'YES' if lesion else 'NO'}\n"
-        f"- Inactivity: {'YES' if behavior else 'NO'}\n"
+        "CURRENT STATUS SNAPSHOT:\n"
+        f"- Fever: {'YES' if fever else 'NO'}\n"
+        f"  Max temperature: {THERMAL_MAX_TEMP:.1f} °C\n"
+        f"- ASF Lesion: {'YES' if lesion else 'NO'}\n"
+        f"- Inactivity: {'YES' if behavior else 'NO'}\n\n"
+        f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
+
 
 # ================= THERMAL =================
 def draw_thermal_legend(img,tmin=20.0,tmax=40.0):
@@ -1261,43 +1264,37 @@ while True:
         
         gsm_init()
         
-        # ===== LEVEL 3: ALL THREE CURRENT =====
+        # ===== CRITICAL: ALL THREE =====
         if fever_detected and ASF_DETECTED and BEHAVIOR_ALERT:
             send_sms(
                 "🚨🚨 CRITICAL ASF ALERT 🚨🚨\n"
-                "ALL THREE indicators detected SIMULTANEOUSLY!\n\n"
-                + status_block +
-                f"\nTime: {date} {tstamp}"
+                "All three indicators detected SIMULTANEOUSLY!\n\n"
+                + status_block
             )
         
-        # ===== LEVEL 2: INACTIVITY + (FEVER OR LESION) =====
+        # ===== HIGH RISK: INACTIVITY + (FEVER OR LESION) =====
         elif BEHAVIOR_ALERT and (fever_detected or ASF_DETECTED):
             send_sms(
                 "⚠️ HIGH RISK ASF ALERT ⚠️\n"
-                "Inactivity detected WITH another indicator!\n\n"
-                + status_block +
-                f"\nTime: {date} {tstamp}"
+                "Inactivity detected with another abnormal indicator.\n\n"
+                + status_block
             )
         
-        # ===== LEVEL 2: FEVER + LESION (NO INACTIVITY) =====
+        # ===== HIGH RISK: FEVER + LESION =====
         elif fever_detected and ASF_DETECTED:
             send_sms(
                 "⚠️ HIGH RISK ASF ALERT ⚠️\n"
-                "Fever and lesion detected together!\n\n"
-                + status_block +
-                f"\nTime: {date} {tstamp}"
+                "Fever and ASF lesion detected together.\n\n"
+                + status_block
             )
         
-        # ===== LEVEL 1: SINGLE FEVER OR LESION ONLY =====
-        elif fever_detected or ASF_DETECTED:
+        # ===== WARNING: SINGLE INDICATOR =====
+        elif fever_detected or ASF_DETECTED or BEHAVIOR_ALERT:
             send_sms(
                 "⚠️ ASF WARNING ⚠️\n"
-                "Single abnormal indicator detected.\n\n"
-                + status_block +
-                f"\nTime: {date} {tstamp}"
+                "At least one abnormal indicator detected.\n\n"
+                + status_block
             )
-
-
 
     # FPS display
     now = time.time()
