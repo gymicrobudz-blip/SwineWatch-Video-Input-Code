@@ -1264,37 +1264,22 @@ while True:
         
         gsm_init()
         
-        # ===== CRITICAL: ALL THREE =====
-        if fever_detected and ASF_DETECTED and BEHAVIOR_ALERT:
-            send_sms(
-                "🚨🚨 CRITICAL ASF ALERT 🚨🚨\n"
-                "All three indicators detected SIMULTANEOUSLY!\n\n"
-                + status_block
-            )
+        alert_triggered = (
+            BEHAVIOR_ALERT or
+            fever_detected or
+            ASF_DETECTED
+        )
         
-        # ===== HIGH RISK: INACTIVITY + (FEVER OR LESION) =====
-        elif BEHAVIOR_ALERT and (fever_detected or ASF_DETECTED):
+        if alert_triggered:
             send_sms(
-                "⚠️ HIGH RISK ASF ALERT ⚠️\n"
-                "Inactivity detected with another abnormal indicator.\n\n"
-                + status_block
+                "⚠️ ASF ALERT ⚠️\n\n" +
+                format_status_block(
+                    fever_detected,
+                    ASF_DETECTED,
+                    BEHAVIOR_ALERT
+                )
             )
-        
-        # ===== HIGH RISK: FEVER + LESION =====
-        elif fever_detected and ASF_DETECTED:
-            send_sms(
-                "⚠️ HIGH RISK ASF ALERT ⚠️\n"
-                "Fever and ASF lesion detected together.\n\n"
-                + status_block
-            )
-        
-        # ===== WARNING: SINGLE INDICATOR =====
-        elif fever_detected or ASF_DETECTED or BEHAVIOR_ALERT:
-            send_sms(
-                "⚠️ ASF WARNING ⚠️\n"
-                "At least one abnormal indicator detected.\n\n"
-                + status_block
-            )
+
 
     # FPS display
     now = time.time()
