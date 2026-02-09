@@ -1275,7 +1275,8 @@ while True:
         )
         
         gsm_init()
-        
+        send_sms("?? TEST MESSAGE\nGSM SMS PIPELINE OK")
+
         alert_triggered = (
             BEHAVIOR_ALERT or
             fever_detected or
