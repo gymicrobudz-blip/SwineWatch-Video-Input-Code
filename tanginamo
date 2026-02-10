@@ -143,7 +143,7 @@ BEHAVIOR_ALERT = False
 ABNORMAL_BEHAVIORS = {"INACTIVE"}  # add more if needed
 
 # ================= FEVER LOGIC =================
-FEVER_DELTA_C = 7.5         # rise indicates fever
+FEVER_DELTA_C = 3.0         # rise indicates fever
 thermal_hourly_avg = {}     # hour_key -> avgTemp
 
 # ================= GSM =================
@@ -197,6 +197,18 @@ def pig_id(box):
 
 def interval_seconds(mode,value):
     return value*60 if mode=="minute" else value*3600
+
+def compute_thermal_baseline(hourly_avg, window=4):
+    """
+    Computes rolling baseline over last N hours.
+    This adapts automatically to day/night temperature changes.
+    """
+    keys = sorted(hourly_avg.keys())
+    if len(keys) < window:
+        return None
+
+    recent_keys = keys[-window:]
+    return sum(hourly_avg[k] for k in recent_keys) / window
 
 def upload_to_cloudinary(image_path, date):
     try:
@@ -1087,17 +1099,33 @@ while True:
         # ---- FEVER DETECTION (UNIFIED) ----
         hour_key = time.strftime("%Y-%m-%d %H-00")
 
+        # ---- FEVER DETECTION (UNIFIED, BASELINE-AWARE) ----
+
         fever_delta = False
         fever_absolute = THERMAL_MAX_TEMP >= ABSOLUTE_FEVER_C
-
-        prev_hours = sorted(thermal_hourly_avg.keys())
-        if len(prev_hours) >= 2:
-            prev_key = prev_hours[-2]
-            delta = thermal_hourly_avg[hour_key] - thermal_hourly_avg[prev_key]
-            if delta >= FEVER_DELTA_C:
+        
+        baseline = compute_thermal_baseline(
+            thermal_hourly_avg,
+            window=4   # last 6 hours baseline
+        )
+        
+        if baseline is not None:
+            current = thermal_hourly_avg[hour_key]
+            delta = current - baseline
+        
+            # Dynamic threshold:
+            # - minimum 3.0 C (sensor + environment noise safe)
+            # - OR 20% increase relative to baseline
+            dynamic_threshold = max(
+                3.0,
+                baseline * 0.2
+            )
+        
+            if delta >= dynamic_threshold:
                 fever_delta = True
-
+        
         fever_detected = fever_absolute or fever_delta
+
         fever_hourly[hour_key] = fever_detected
 
         lesion_hourly[hour_key] = ASF_DETECTED
