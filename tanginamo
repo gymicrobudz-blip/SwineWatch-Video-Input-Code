@@ -143,14 +143,15 @@ BEHAVIOR_ALERT = False
 ABNORMAL_BEHAVIORS = {"INACTIVE"}  # add more if needed
 
 # ================= FEVER LOGIC =================
-FEVER_DELTA_C = 2.0          # >= 2ÃƒÂ¯Ã‚Â¿Ã‚Â½C rise indicates fever
+FEVER_DELTA_C = 7.5         # rise indicates fever
 thermal_hourly_avg = {}     # hour_key -> avgTemp
 
 # ================= GSM =================
 GSM_PORT = "/dev/ttyAMA0"
 GSM_BAUD = 9600
 SMS_NUMBERS = ["+639499884195", "+639209615316"]
-SMS_TEMP_THRESHOLD = 40# ================= FEVER THRESHOLDS =================
+SMS_TEMP_THRESHOLD = 38
+# ================= FEVER THRESHOLDS =================
 ABSOLUTE_FEVER_C = SMS_TEMP_THRESHOLD  # reuse GSM threshold
 
 gsm = None
