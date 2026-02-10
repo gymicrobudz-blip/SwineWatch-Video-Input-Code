@@ -49,7 +49,7 @@ cv2.ocl.setUseOpenCL(False)
 
 # ================= CONFIG =================
 INPUT_SIZE = 416
-INTERVAL_MODE = "hour"
+INTERVAL_MODE = "minute"
 INTERVAL_VALUE = 1
 SAVE_ROOT = "/home/asfrotect/Desktop/detections"
 PI_CAM_FPS = 0.0
